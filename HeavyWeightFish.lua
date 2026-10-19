@@ -988,4 +988,4 @@ pcall(function()
         Duration = 4,
     })
 end)
-print("★ [PPINGYYY] Auto Fish v2 loaded (Auto Cast + Delay + Anchor Bar + Auto Skill + Economy)")
+print("★ [PPINGYYY] Auto Fish v2 loaded (Auto Cast + Delay + Anchor Bar + Auto Skill + Economy V2)")
