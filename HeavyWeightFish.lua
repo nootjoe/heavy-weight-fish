@@ -1,6 +1,6 @@
 --[[
     ★ PPINGYYY AUTO FISH ★  v2
-    Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling
+    Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling + Anti-AFK + Money Stats + Discord Webhook + "4896 Polar Bear" intro
 
     Game logic used (taken from the working fishing script):
       Character attributes : Type ("Fishing Rod"), Fishing, Minigame, CDForTheNextThrow, Swimming
@@ -15,6 +15,9 @@
                              Events.SellFish           -> FireServer("All")
                              Events.FavoriteItem       -> FireServer(item)
                              Data[UserId].Hotbar / Inventory (items have .Favorite) / InventoryLimit
+    Anti-AFK   : Player.Idled + VirtualUser (click) so Roblox does not kick you after 20 min idle
+    Money stats: Data[UserId].Cash / FishCaught / FishingRod / EquippedBait
+    Webhook    : executor request() -> Discord webhook (embed), interval slider 1-120 min
     RightControl hides / shows the window.
 ]]
 
@@ -32,6 +35,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local StarterGui = game:GetService("StarterGui")
+local HttpService = game:GetService("HttpService")
 local lp = Players.LocalPlayer
 
 local VIM = nil
@@ -58,6 +62,11 @@ local Config = {
     AutoFavourite = false,    -- protect the chosen fish from being sold
     FavouriteFishName = "Colossal Tigerfish",
     MaterialFarming = false,  -- protect the craft-material fish from being sold
+    -- utilities
+    AntiAFK = true,
+    WebhookEnabled = false,
+    WebhookUrl = "",
+    WebhookInterval = 15,     -- minutes between webhook reports
 }
 
 local DELAY_MIN, DELAY_MAX, DELAY_STEP = 0.5, 5.0, 0.1
@@ -278,6 +287,298 @@ local function hookRemotes(Events)
 end
 
 local function yn(v) return v and "yes" or "no" end
+
+---------------------------------------------------------------------
+-- Anti-AFK / Money Stats / Discord Webhook (helpers)
+---------------------------------------------------------------------
+local WEBHOOK_MIN, WEBHOOK_MAX = 1, 120   -- minutes
+local AFK_KEEPALIVE = 600                 -- extra anti-afk ping every 10 min (Roblox kicks idle players after 20 min)
+local SETTINGS_FILE = "PPINGYYY_AutoFish.json"
+local WEBHOOK_PREFIXES = {
+    "https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
+    "https://ptb.discord.com/api/webhooks/", "https://canary.discord.com/api/webhooks/",
+}
+
+local ui = {}            -- UI setters, filled when the UI is built
+local uiReady = false
+local settingsDirtyAt = nil
+local session = { startTime = tick(), startCash = nil, startFish = nil }
+local afk = { pings = 0, last = tick() }
+local webhookBusy = false
+local lastWebhookTime = tick()   -- when the last report was sent / when the timer was (re)started
+local webhookStatus = "Idle"
+local lastStatsTime = 0
+
+-- settings that survive a re-execute (webhook url + interval + anti-afk) -------------
+local function saveSettings()
+    if not writefile then return end
+    pcall(function()
+        writefile(SETTINGS_FILE, HttpService:JSONEncode({
+            WebhookUrl = Config.WebhookUrl, WebhookInterval = Config.WebhookInterval, AntiAFK = Config.AntiAFK,
+        }))
+    end)
+end
+
+local function markDirty()
+    if uiReady then settingsDirtyAt = tick() end
+end
+
+local function loadSettings()
+    if not (isfile and readfile) then return end
+    pcall(function()
+        if isfile(SETTINGS_FILE) then
+            local data = HttpService:JSONDecode(readfile(SETTINGS_FILE))
+            if type(data) == "table" then
+                if type(data.WebhookUrl) == "string" then Config.WebhookUrl = data.WebhookUrl end
+                if type(data.WebhookInterval) == "number" then
+                    Config.WebhookInterval = math.clamp(math.floor(data.WebhookInterval), WEBHOOK_MIN, WEBHOOK_MAX)
+                end
+                if type(data.AntiAFK) == "boolean" then Config.AntiAFK = data.AntiAFK end
+            end
+        end
+    end)
+end
+loadSettings()
+
+-- formatting ------------------------------------------------------------------------
+local function commas(n)
+    local s = string.format("%.0f", math.abs(n))
+    local k
+    while true do
+        s, k = string.gsub(s, "^(%d+)(%d%d%d)", "%1,%2")
+        if k == 0 then break end
+    end
+    if n < 0 and s ~= "0" then s = "-" .. s end
+    return s
+end
+
+local function signedMoney(n)
+    if n >= 0 then return "+$" .. commas(n) end
+    return "-$" .. commas(math.abs(n))
+end
+
+local function fmtTime(sec)
+    sec = math.max(0, math.floor(sec))
+    return string.format("%02d:%02d:%02d", math.floor(sec / 3600), math.floor((sec % 3600) / 60), sec % 60)
+end
+
+local function fmtAgo(sec)
+    sec = math.max(0, math.floor(sec))
+    if sec < 60 then return sec .. "s ago" end
+    return math.floor(sec / 60) .. "m ago"
+end
+
+local function perHour(delta, elapsed)
+    if elapsed < 10 then return 0 end
+    return delta / (elapsed / 3600)
+end
+
+-- Anti-AFK ----------------------------------------------------------------------------
+-- Roblox fires Player.Idled after ~20 minutes without input and then kicks the player.
+-- VirtualUser lets us fake a click so the idle timer is reset.
+local function afkPing()
+    local ok = pcall(function()
+        local vu = game:GetService("VirtualUser")
+        vu:CaptureController()
+        vu:ClickButton2(Vector2.new(0, 0))
+    end)
+    if ok then
+        afk.pings = afk.pings + 1
+        afk.last = tick()
+    end
+    return ok
+end
+
+conns[#conns + 1] = lp.Idled:Connect(function()
+    if running and Config.AntiAFK then afkPing() end
+end)
+
+-- Money stats (Data[UserId].Cash / FishCaught / FishingRod / EquippedBait) ---------------
+local function readStats()
+    local pData = getData()
+    if not pData then return nil end
+    local function num(name)
+        local v = pData:FindFirstChild(name)
+        return v and tonumber(v.Value) or nil
+    end
+    local function str(name)
+        local v = pData:FindFirstChild(name)
+        local s = v and tostring(v.Value) or ""
+        if s == "" then s = "None" end
+        return s
+    end
+    return { cash = num("Cash"), fish = num("FishCaught"), rod = str("FishingRod"), bait = str("EquippedBait") }
+end
+
+local function resetSession()
+    session.startTime = tick()
+    session.startCash = nil
+    session.startFish = nil
+end
+
+local function sessionNumbers(st, now)
+    local elapsed = now - session.startTime
+    local netCash = (st.cash and session.startCash) and (st.cash - session.startCash) or 0
+    local fishGain = (st.fish and session.startFish) and (st.fish - session.startFish) or 0
+    return elapsed, netCash, fishGain
+end
+
+-- Discord webhook -----------------------------------------------------------------------
+local function validWebhook(url)
+    if type(url) ~= "string" or string.find(url, "%s") then return false end
+    for _, pre in ipairs(WEBHOOK_PREFIXES) do
+        if string.sub(url, 1, #pre) == pre and #url > #pre + 10 then return true end
+    end
+    return false
+end
+
+local function getHttpRequest()
+    local getters = {
+        function() return request end,
+        function() return http_request end,
+        function() return syn and syn.request end,
+        function() return http and http.request end,
+        function() return fluxus and fluxus.request end,
+    }
+    for _, g in ipairs(getters) do
+        local ok, fn = pcall(g)
+        if ok and type(fn) == "function" then return fn end
+    end
+    return nil
+end
+
+local function buildPayload(st, reason)
+    local now = tick()
+    local elapsed, netCash, fishGain = sessionNumbers(st, now)
+    local desc = (reason == "test") and "Test report" or ("Scheduled report (every " .. Config.WebhookInterval .. " min)")
+    local fields = {
+        { name = "👤 Player", value = lp.DisplayName .. " (@" .. lp.Name .. ")", inline = true },
+        { name = "💰 Cash", value = "$" .. commas(st.cash or 0), inline = true },
+        { name = "📈 Net Cash (session)", value = signedMoney(netCash), inline = true },
+        { name = "⏱️ Cash / hour", value = signedMoney(perHour(netCash, elapsed)), inline = true },
+        { name = "🐟 Fish Caught", value = commas(st.fish or 0), inline = true },
+        { name = "🎣 Fish (session)", value = "+" .. commas(fishGain) .. "  (" .. commas(perHour(fishGain, elapsed)) .. "/h)", inline = true },
+        { name = "🪝 Rod", value = st.rod, inline = true },
+        { name = "🪱 Bait", value = st.bait, inline = true },
+        { name = "🕒 Session Time", value = fmtTime(elapsed), inline = true },
+    }
+    return {
+        username = "4896 Polar Bear",
+        embeds = { {
+            title = "📊 Money Stats Report",
+            description = desc,
+            color = 57855,
+            fields = fields,
+            footer = { text = "4896 Polar Bear • Auto Fish" },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        } },
+    }
+end
+
+local function sendWebhook(reason)
+    if webhookBusy then return end
+    local url = Config.WebhookUrl
+    if not validWebhook(url) then
+        webhookStatus = "Invalid webhook URL"
+        return
+    end
+    local req = getHttpRequest()
+    if not req then
+        webhookStatus = "Executor has no request() function"
+        return
+    end
+    local st = readStats()
+    if not st then
+        webhookStatus = "No player data found"
+        return
+    end
+    webhookBusy = true
+    lastWebhookTime = tick()
+    webhookStatus = "Sending..."
+    task.spawn(function()
+        local ok, resp = pcall(function()
+            return req({
+                Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode(buildPayload(st, reason)),
+            })
+        end)
+        if ok and type(resp) == "table" then
+            local code = resp.StatusCode or resp.status_code
+            local good = (type(code) == "number" and code >= 200 and code < 300) or (code == nil and resp.Success == true)
+            if good then
+                webhookStatus = "Sent OK (" .. os.date("%H:%M:%S") .. ")"
+            else
+                webhookStatus = "Failed: HTTP " .. tostring(code)
+            end
+        else
+            webhookStatus = "Failed: " .. tostring(resp)
+        end
+        webhookBusy = false
+    end)
+end
+
+-- runs every frame next to the cast engine (separate pcall, so one can't break the other)
+local function utilityStep()
+    local now = tick()
+
+    -- anti-afk keep-alive
+    if Config.AntiAFK and (now - afk.last >= AFK_KEEPALIVE) then afkPing() end
+
+    -- debounced settings save
+    if settingsDirtyAt and now - settingsDirtyAt >= 1.5 then
+        settingsDirtyAt = nil
+        saveSettings()
+    end
+
+    -- webhook timer
+    if Config.WebhookEnabled and not webhookBusy and (now - lastWebhookTime >= Config.WebhookInterval * 60) then
+        sendWebhook("timer")
+    end
+
+    -- once per second: refresh the stats panel
+    if now - lastStatsTime < 1 then return end
+    lastStatsTime = now
+    if not ui.stats then return end
+
+    local S = ui.stats
+    local st = readStats()
+    if not st or not st.cash then
+        S.cash("waiting for data...")
+    else
+        if session.startCash == nil then
+            session.startCash = st.cash
+            session.startFish = st.fish
+            session.startTime = now
+        end
+        local elapsed, netCash, fishGain = sessionNumbers(st, now)
+        S.cash("$" .. commas(st.cash))
+        S.net(signedMoney(netCash))
+        S.cph(signedMoney(perHour(netCash, elapsed)))
+        S.fish(commas(st.fish or 0))
+        S.fsess("+" .. commas(fishGain))
+        S.fph(commas(perHour(fishGain, elapsed)) .. " / h")
+        S.time(fmtTime(elapsed))
+        S.rod(st.rod)
+        S.bait(st.bait)
+    end
+
+    if ui.afk then
+        if Config.AntiAFK then
+            ui.afk("ON - last ping " .. fmtAgo(now - afk.last) .. " (" .. afk.pings .. ")")
+        else
+            ui.afk("OFF")
+        end
+    end
+    if ui.hook then
+        if Config.WebhookEnabled then
+            local left = Config.WebhookInterval * 60 - (now - lastWebhookTime)
+            ui.hook.next(fmtTime(math.max(0, left)))
+        else
+            ui.hook.next("Off")
+        end
+        ui.hook.status(webhookStatus)
+    end
+end
 
 ---------------------------------------------------------------------
 -- Engine (one Heartbeat connection)
@@ -542,9 +843,7 @@ pcall(function()
     end
 end)
 
-local sg = new("ScreenGui", { Name = "PPINGYYY_AutoFish", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
-do
-    local parented = false
+local function attachGui(gui)
     local getters = {
         function() return gethui and gethui() end,
         function() return game:GetService("CoreGui") end,
@@ -552,12 +851,15 @@ do
     for _, getter in ipairs(getters) do
         local ok, p = pcall(getter)
         if ok and p then
-            local ok2 = pcall(function() sg.Parent = p end)
-            if ok2 and sg.Parent == p then parented = true break end
+            local ok2 = pcall(function() gui.Parent = p end)
+            if ok2 and gui.Parent == p then return end
         end
     end
-    if not parented then sg.Parent = lp:WaitForChild("PlayerGui") end
+    gui.Parent = lp:WaitForChild("PlayerGui")
 end
+
+local sg = new("ScreenGui", { Name = "PPINGYYY_AutoFish", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+attachGui(sg)
 
 local function makeSound(id)
     local s = new("Sound", { Volume = 1 }, sg)
@@ -864,6 +1166,101 @@ toggleButton("Material Farming (protect craft fish)", 28, Config.MaterialFarming
     Config.MaterialFarming = v
 end)
 
+-- generic info card (label on the left, value on the right) -------------
+local function infoCard(rows)
+    local card = new("Frame", {
+        Size = UDim2.new(1, 0, 0, #rows * 22 + 8), BackgroundColor3 = COL_ROW, BorderSizePixel = 0, LayoutOrder = nextOrder(),
+    }, Body)
+    corner(card, 6)
+    local setters = {}
+    for i, r in ipairs(rows) do
+        local y = 4 + (i - 1) * 22
+        new("TextLabel", {
+            Size = UDim2.new(0.45, -8, 0, 22), Position = UDim2.new(0, 8, 0, y), BackgroundTransparency = 1, Text = r[2],
+            TextColor3 = Color3.fromRGB(150, 150, 150), Font = Enum.Font.Gotham, TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, card)
+        local v = new("TextLabel", {
+            Size = UDim2.new(0.55, -8, 0, 22), Position = UDim2.new(0.45, 0, 0, y), BackgroundTransparency = 1, Text = "-",
+            TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, card)
+        setters[r[1]] = function(text) v.Text = text end
+    end
+    return setters
+end
+
+-- 🛡️ Anti AFK ----------------------------------------------------------
+section("🛡️ ANTI AFK")
+toggleButton("Anti-AFK (prevents the 20 min idle kick)", 28, Config.AntiAFK, function(v)
+    play(clickSound)
+    Config.AntiAFK = v
+    markDirty()
+end)
+ui.afk = infoCard({ { "afk", "Status" } }).afk
+
+-- 📊 Money Stats --------------------------------------------------------
+section("📊 MONEY STATS")
+ui.stats = infoCard({
+    { "cash", "Current Cash" }, { "net", "Net Cash (session)" }, { "cph", "Cash / hour" },
+    { "fish", "Total Fish Caught" }, { "fsess", "Fish (session)" }, { "fph", "Fish / hour" },
+    { "time", "Session Time" }, { "rod", "Equipped Rod" }, { "bait", "Equipped Bait" },
+})
+actionButton("🔄 Reset Session", 26, function()
+    play(clickSound)
+    resetSession()
+end)
+
+-- 🔔 Discord Webhook ------------------------------------------------------
+section("🔔 DISCORD WEBHOOK")
+
+local urlBox = new("TextBox", {
+    Size = UDim2.new(1, 0, 0, 30), LayoutOrder = nextOrder(), BackgroundColor3 = COL_ROW, BorderSizePixel = 0, Text = "",
+    PlaceholderText = "Paste your Discord webhook URL here", PlaceholderColor3 = Color3.fromRGB(120, 120, 120),
+    TextColor3 = COL_GREEN, Font = Enum.Font.Gotham, TextSize = 10, ClearTextOnFocus = false,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+}, Body)
+corner(urlBox, 6)
+new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, urlBox)
+local function maskedUrl(url)
+    if url == "" then return "" end
+    return "https://discord.com/api/webhooks/…" .. string.sub(url, -4)
+end
+urlBox.Text = maskedUrl(Config.WebhookUrl)
+urlBox.Focused:Connect(function() urlBox.Text = Config.WebhookUrl end)
+urlBox.FocusLost:Connect(function()
+    local txt = (string.gsub(urlBox.Text, "^%s+", ""))
+    txt = (string.gsub(txt, "%s+$", ""))
+    if txt == "" then
+        Config.WebhookUrl = ""
+        webhookStatus = "URL cleared"
+        markDirty()
+    elseif not string.find(txt, "…", 1, true) then
+        Config.WebhookUrl = txt
+        webhookStatus = validWebhook(txt) and "URL saved" or "Not a Discord webhook URL"
+        markDirty()
+    end
+    urlBox.Text = maskedUrl(Config.WebhookUrl)
+end)
+
+toggleButton("Webhook Reports", 32, Config.WebhookEnabled, function(v)
+    play(clickSound)
+    Config.WebhookEnabled = v
+    lastWebhookTime = tick()
+    if v and not validWebhook(Config.WebhookUrl) then webhookStatus = "Set a valid webhook URL first" end
+end)
+makeSlider("Report Every", "min", WEBHOOK_MIN, WEBHOOK_MAX, 1, 5, 0, Config.WebhookInterval, function(v)
+    Config.WebhookInterval = v
+    lastWebhookTime = tick()  -- changing the interval restarts the countdown
+    markDirty()
+end)
+actionButton("📨 Send Test Report Now", 28, function()
+    play(sellSound)
+    sendWebhook("test")
+end)
+ui.hook = infoCard({ { "next", "Next report in" }, { "status", "Last result" } })
+uiReady = true
+
 -- status (always visible at the bottom) ------------------------------
 local StatusBox = new("Frame", {
     Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -76), BackgroundColor3 = COL_ROW, BorderSizePixel = 0,
@@ -928,13 +1325,17 @@ MinBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+local cleanupIntro = nil
+
 local function unload()
     if not running then return end
     running = false
     Config.AutoCast = false
     Config.AutoSkill = false
     Config.AutoSell = false
+    Config.WebhookEnabled = false
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    if cleanupIntro then pcall(cleanupIntro) end
     pcall(function() sg:Destroy() end)
     if env.PPAutoFishUnload == unload then env.PPAutoFishUnload = nil end
 end
@@ -953,6 +1354,255 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, processe
 end)
 
 ---------------------------------------------------------------------
+-- Intro animation: "4896 Polar Bear"
+-- (set getgenv().PP_ShowIntro = false before running to disable it; click / tap skips it)
+---------------------------------------------------------------------
+local INTRO_TEXT = "4896 Polar Bear"
+local SHOW_INTRO = (env.PP_ShowIntro ~= false)
+local introGui, introBlur = nil, nil
+local introConns = {}
+
+cleanupIntro = function()
+    for _, c in ipairs(introConns) do pcall(function() c:Disconnect() end) end
+    introConns = {}
+    if introGui then
+        pcall(function() introGui:Destroy() end)
+        introGui = nil
+    end
+    if introBlur then
+        pcall(function() introBlur:Destroy() end)
+        introBlur = nil
+    end
+end
+
+local function playIntro()
+    local cam = workspace.CurrentCamera
+    local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
+    local titleSize = math.clamp(math.floor(vp.X / 12), 30, 76)
+    local titleH = titleSize + 14
+    local ICE = Color3.fromRGB(0, 225, 255)
+    local SNOW = Color3.fromRGB(235, 248, 255)
+    local skip = false
+
+    local gui = new("ScreenGui", {
+        Name = "PPINGYYY_Intro", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    attachGui(gui)
+    introGui = gui
+
+    local function sleep(t)
+        local e = tick() + t
+        while running and not skip and tick() < e do task.wait(0.03) end
+    end
+
+    -- dark icy background -------------------------------------------------
+    local bg = new("Frame", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ZIndex = 1,
+    }, gui)
+    new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(3, 8, 20), Color3.fromRGB(8, 40, 75)) }, bg)
+    TweenService:Create(bg, TweenInfo.new(0.45), { BackgroundTransparency = 0.05 }):Play()
+
+    -- everything else lives in one CanvasGroup so it can fade out in one tween
+    local content = new("CanvasGroup", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 2 }, gui)
+
+    local skipBtn = new("TextButton", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", ZIndex = 100, AutoButtonColor = false,
+    }, gui)
+    skipBtn.MouseButton1Click:Connect(function() skip = true end)
+    new("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -14), Size = UDim2.new(0, 300, 0, 16),
+        BackgroundTransparency = 1, Text = "tap / click to skip", TextColor3 = SNOW, TextTransparency = 0.6,
+        Font = Enum.Font.Gotham, TextSize = 11, ZIndex = 3,
+    }, content)
+
+    -- blur the game behind ---------------------------------------------------
+    pcall(function()
+        local blur = Instance.new("BlurEffect")
+        blur.Size = 0
+        blur.Parent = game:GetService("Lighting")
+        introBlur = blur
+        TweenService:Create(blur, TweenInfo.new(0.5), { Size = 22 }):Play()
+    end)
+
+    -- falling snow -------------------------------------------------------------
+    local flakes = {}
+    for i = 1, 45 do
+        local s = math.random(3, 8)
+        local f = new("Frame", {
+            Size = UDim2.new(0, s, 0, s), BackgroundColor3 = SNOW, BackgroundTransparency = math.random(25, 70) / 100,
+            BorderSizePixel = 0, ZIndex = 2,
+        }, content)
+        corner(f, s)
+        flakes[i] = {
+            f = f, x = math.random(), y = math.random(), speed = 0.05 + math.random() * 0.12,
+            sway = math.random() * 6.28, amp = 0.01 + math.random() * 0.02,
+        }
+    end
+    local snowStart = tick()
+    introConns[#introConns + 1] = RunService.RenderStepped:Connect(function(dt)
+        local t = tick() - snowStart
+        for _, fl in ipairs(flakes) do
+            fl.y = fl.y + fl.speed * dt
+            if fl.y > 1.05 then
+                fl.y = -0.05
+                fl.x = math.random()
+            end
+            fl.f.Position = UDim2.new(fl.x + math.sin(t * 1.2 + fl.sway) * fl.amp, 0, fl.y, 0)
+        end
+    end)
+
+    -- title: every letter rises out of a mask ---------------------------------
+    local title = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.45, 0), Size = UDim2.new(1, 0, 0, titleH),
+        BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 5,
+    }, content)
+    local titleScale = new("UIScale", { Scale = 0.92 }, title)
+    local row = new("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1 }, title)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2),
+    }, row)
+
+    local letters = {}
+    local count = 0
+    for i = 1, #INTRO_TEXT do
+        local ch = string.sub(INTRO_TEXT, i, i)
+        local w
+        if ch == " " then
+            w = math.floor(titleSize * 0.38)
+        else
+            local ok, sz = pcall(function()
+                return game:GetService("TextService"):GetTextSize(ch, titleSize, Enum.Font.GothamBlack, Vector2.new(1000, 1000))
+            end)
+            w = ((ok and sz) and sz.X or math.floor(titleSize * 0.7)) + 2
+        end
+        local slot = new("Frame", { Size = UDim2.new(0, w, 1, 0), BackgroundTransparency = 1, LayoutOrder = i }, row)
+        if ch ~= " " then
+            local lbl = new("TextLabel", {
+                Size = UDim2.new(1, 0, 1, 0), Position = UDim2.new(0, 0, 1.1, 0), BackgroundTransparency = 1, Text = ch,
+                Font = Enum.Font.GothamBlack, TextSize = titleSize, TextColor3 = (i <= 4) and ICE or Color3.new(1, 1, 1),
+                TextTransparency = 1,
+            }, slot)
+            local stroke = new("UIStroke", { Color = ICE, Thickness = 2, Transparency = 1 }, lbl)
+            count = count + 1
+            letters[count] = { lbl = lbl, stroke = stroke }
+        end
+    end
+    for idx, l in ipairs(letters) do
+        task.delay(0.35 + idx * 0.07, function()
+            if not running then return end
+            TweenService:Create(l.lbl, TweenInfo.new(0.55, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Position = UDim2.new(0, 0, 0, 0), TextTransparency = 0,
+            }):Play()
+            TweenService:Create(l.stroke, TweenInfo.new(0.55), { Transparency = 0.45 }):Play()
+        end)
+    end
+    TweenService:Create(titleScale, TweenInfo.new(1.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+
+    -- shine sweeping across the finished title ----------------------------------
+    local shine = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, -titleSize, 0.5, 0),
+        Size = UDim2.new(0, math.floor(titleSize * 0.9), 3, 0), Rotation = 18, BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0, ZIndex = 20,
+    }, title)
+    new("UIGradient", {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.3), NumberSequenceKeypoint.new(1, 1),
+        }),
+    }, shine)
+    task.delay(2.0, function()
+        if not running then return end
+        TweenService:Create(shine, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {
+            Position = UDim2.new(0, vp.X + titleSize, 0.5, 0),
+        }):Play()
+    end)
+
+    -- accent line + subtitle ------------------------------------------------------
+    local lineY = math.floor(titleH / 2) + 14
+    local line = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.45, lineY), Size = UDim2.new(0, 0, 0, 2),
+        BackgroundColor3 = ICE, BorderSizePixel = 0, ZIndex = 5,
+    }, content)
+    new("UIGradient", {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.25, 0),
+            NumberSequenceKeypoint.new(0.75, 0), NumberSequenceKeypoint.new(1, 1),
+        }),
+    }, line)
+    task.delay(1.5, function()
+        if not running then return end
+        TweenService:Create(line, TweenInfo.new(0.8, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, math.floor(vp.X * 0.42), 0, 2),
+        }):Play()
+    end)
+    local sub = new("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.45, lineY + 12), Size = UDim2.new(1, 0, 0, 24),
+        BackgroundTransparency = 1, Text = "❄  A U T O   F I S H  ❄", Font = Enum.Font.GothamBold, TextSize = 15,
+        TextColor3 = ICE, TextTransparency = 1, ZIndex = 5,
+    }, content)
+    task.delay(1.9, function()
+        if not running then return end
+        TweenService:Create(sub, TweenInfo.new(0.6), { TextTransparency = 0.1 }):Play()
+    end)
+
+    -- loading bar ------------------------------------------------------------------
+    local barW = math.clamp(math.floor(vp.X * 0.5), 200, 420)
+    local barBg = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.82, 0), Size = UDim2.new(0, barW, 0, 5),
+        BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 5,
+    }, content)
+    corner(barBg, 3)
+    local barFill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = ICE, BorderSizePixel = 0, ZIndex = 6 }, barBg)
+    corner(barFill, 3)
+    new("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(0, 140, 255), Color3.fromRGB(150, 255, 255)) }, barFill)
+    local pct = new("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0.82, -10), Size = UDim2.new(0, barW, 0, 16),
+        BackgroundTransparency = 1, Text = "LOADING  0%", Font = Enum.Font.GothamBold, TextSize = 11,
+        TextColor3 = SNOW, TextTransparency = 1, ZIndex = 5,
+    }, content)
+    TweenService:Create(barBg, TweenInfo.new(0.5), { BackgroundTransparency = 0.85 }):Play()
+    TweenService:Create(pct, TweenInfo.new(0.5), { TextTransparency = 0.2 }):Play()
+
+    local loadStart = tick() + 0.5
+    local loadTime = 2.8
+    while running and not skip do
+        local p = math.clamp((tick() - loadStart) / loadTime, 0, 1)
+        barFill.Size = UDim2.new(p, 0, 1, 0)
+        pct.Text = string.format("LOADING  %d%%", math.floor(p * 100))
+        if p >= 1 then break end
+        task.wait(0.03)
+    end
+    if not running then return end
+
+    -- outro: title zooms through the screen while everything fades --------------------
+    barFill.Size = UDim2.new(1, 0, 1, 0)
+    pct.Text = "READY  100%"
+    sleep(0.3)
+    TweenService:Create(titleScale, TweenInfo.new(0.6, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1.4 }):Play()
+    TweenService:Create(content, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
+    TweenService:Create(bg, TweenInfo.new(0.7), { BackgroundTransparency = 1 }):Play()
+    if introBlur then TweenService:Create(introBlur, TweenInfo.new(0.7), { Size = 0 }):Play() end
+    local e = tick() + 0.75
+    while running and tick() < e do task.wait(0.03) end
+end
+
+if SHOW_INTRO then
+    Main.Visible = false
+    task.spawn(function()
+        local ok, err = pcall(playIntro)
+        if not ok then warn("[PPINGYYY AutoFish] intro error: " .. tostring(err)) end
+        cleanupIntro()
+        if running then
+            Main.Size = UDim2.new(0, 360, 0, 0)
+            Main.Visible = true
+            TweenService:Create(Main, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = FULL_SIZE }):Play()
+        end
+    end)
+end
+
+---------------------------------------------------------------------
 -- Start the engine
 ---------------------------------------------------------------------
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
@@ -965,6 +1615,7 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
             warn("[PPINGYYY AutoFish] " .. tostring(err))
         end
     end
+    pcall(utilityStep)
     local now = tick()
     if now - lastUiTime >= 0.2 then
         lastUiTime = now
@@ -988,4 +1639,4 @@ pcall(function()
         Duration = 4,
     })
 end)
-print("★ [PPINGYYY] Auto Fish v2 loaded (Auto Cast + Delay + Anchor Bar + Auto Skill + Economy V2)")
+print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v3 loaded (Auto Cast + Anchor Bar + Skill + Economy + Anti-AFK + Stats + Webhook)")
