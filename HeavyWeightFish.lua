@@ -1,6 +1,6 @@
 --[[
     ★ PPINGYYY AUTO FISH ★  v2
-    Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling + Anti-AFK + Money Stats + Discord Webhook + "4896 Polar Bear" intro
+    Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling + Anti-AFK + Money Stats + Discord Webhook + Taoist/Maoshan ESP + "4896 Polar Bear" intro
 
     Game logic used (taken from the working fishing script):
       Character attributes : Type ("Fishing Rod"), Fishing, Minigame, CDForTheNextThrow, Swimming
@@ -67,6 +67,8 @@ local Config = {
     WebhookEnabled = false,
     WebhookUrl = "",
     WebhookInterval = 15,     -- minutes between webhook reports
+    ESP_Taoist = false,
+    ESP_Maoshan = false,
 }
 
 local DELAY_MIN, DELAY_MAX, DELAY_STEP = 0.5, 5.0, 0.1
@@ -517,9 +519,140 @@ local function sendWebhook(reason)
     end)
 end
 
+---------------------------------------------------------------------
+-- ESP: Taoist / Grand Angler / Maoshan NPCs (Workspace.NPC)
+---------------------------------------------------------------------
+-- Game logic (from the reference script): the NPCs live as children of Workspace.NPC.
+-- Taoist is matched by the name "Taoist" or "Grand Angler", Maoshan by the name "Maoshan".
+local Workspace = game:GetService("Workspace")
+local ESP_SCAN_INTERVAL = 1.0      -- re-scan Workspace.NPC (NPCs can stream in / spawn later)
+local ESP_LABEL_INTERVAL = 0.15    -- distance label refresh
+local ESP_KINDS = {
+    Taoist  = { color = Color3.fromRGB(255, 160, 40), icon = "📜", cfg = "ESP_Taoist" },
+    Maoshan = { color = Color3.fromRGB(170, 120, 255), icon = "✨", cfg = "ESP_Maoshan" },
+}
+local espFolder = Instance.new("Folder")
+espFolder.Name = "PPAutoFishESP"
+espFolder.Parent = Workspace
+local espTracked = {}   -- [npcInstance] = { gui, label, hl, part, kind, name }
+local espLastScan, espLastLabel = 0, 0
+local espFound = { Taoist = 0, Maoshan = 0 }
+
+local function espKindOf(name)
+    local n = string.lower(name)
+    if string.find(n, "taoist", 1, true) or string.find(n, "grand angler", 1, true) then return "Taoist" end
+    if string.find(n, "maoshan", 1, true) then return "Maoshan" end
+    return nil
+end
+
+local function espAnchorPart(inst)
+    if inst:IsA("BasePart") then return inst end
+    if inst:IsA("Model") then
+        if inst.PrimaryPart then return inst.PrimaryPart end
+        local hrp = inst:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp:IsA("BasePart") then return hrp end
+    end
+    return inst:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function espRemove(inst)
+    local d = espTracked[inst]
+    if not d then return end
+    espTracked[inst] = nil
+    pcall(function() d.gui:Destroy() end)
+    pcall(function() if d.hl then d.hl:Destroy() end end)
+end
+
+local function espAdd(inst, kind)
+    if espTracked[inst] then return end
+    local part = espAnchorPart(inst)
+    if not part then return end
+    local info = ESP_KINDS[kind]
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "ESP_" .. inst.Name
+    bb.Size = UDim2.new(0, 170, 0, 24)
+    bb.StudsOffset = Vector3.new(0, 3, 0)
+    bb.AlwaysOnTop = true
+    bb.Adornee = part
+    bb.Enabled = false
+    bb.Parent = espFolder
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 1, 0)
+    f.BackgroundColor3 = Color3.fromRGB(15, 15, 17)
+    f.BackgroundTransparency = 0.2
+    f.BorderSizePixel = 0
+    f.Parent = bb
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = f
+    local s = Instance.new("UIStroke"); s.Color = info.color; s.Thickness = 1; s.Parent = f
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 11
+    lbl.TextColor3 = info.color
+    lbl.Text = info.icon .. " " .. inst.Name
+    lbl.Parent = f
+
+    local hl = nil
+    if inst:IsA("Model") then
+        local okHl = pcall(function()
+            hl = Instance.new("Highlight")
+            hl.Adornee = inst
+            hl.FillColor = info.color
+            hl.OutlineColor = info.color
+            hl.FillTransparency = 0.6
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Enabled = false
+            hl.Parent = espFolder
+        end)
+        if not okHl then hl = nil end
+    end
+    espTracked[inst] = { gui = bb, label = lbl, hl = hl, part = part, kind = kind, name = inst.Name }
+end
+
+local function espStep(now)
+    -- 1) periodic scan
+    if now - espLastScan >= ESP_SCAN_INTERVAL then
+        espLastScan = now
+        local anyOn = Config.ESP_Taoist or Config.ESP_Maoshan
+        local npcFolder = Workspace:FindFirstChild("NPC")
+        espFound.Taoist, espFound.Maoshan = 0, 0
+        if npcFolder then
+            for _, n in ipairs(npcFolder:GetChildren()) do
+                local kind = espKindOf(n.Name)
+                if kind then
+                    espFound[kind] = espFound[kind] + 1
+                    if anyOn then espAdd(n, kind) end
+                end
+            end
+        end
+        for inst, d in pairs(espTracked) do
+            if not inst.Parent or not d.part.Parent then espRemove(inst) end
+        end
+    end
+
+    -- 2) visibility + distance label
+    if now - espLastLabel >= ESP_LABEL_INTERVAL then
+        espLastLabel = now
+        local cam = Workspace.CurrentCamera
+        local camPos = cam and cam.CFrame.Position
+        for inst, d in pairs(espTracked) do
+            local on = Config[ESP_KINDS[d.kind].cfg] and true or false
+            d.gui.Enabled = on
+            if d.hl then d.hl.Enabled = on end
+            if on and camPos then
+                local dist = math.floor((camPos - d.part.Position).Magnitude)
+                d.label.Text = ESP_KINDS[d.kind].icon .. " " .. d.name .. " [" .. dist .. "m]"
+            end
+        end
+    end
+end
+
 -- runs every frame next to the cast engine (separate pcall, so one can't break the other)
 local function utilityStep()
     local now = tick()
+    pcall(espStep, now)
 
     -- anti-afk keep-alive
     if Config.AntiAFK and (now - afk.last >= AFK_KEEPALIVE) then afkPing() end
@@ -562,6 +695,10 @@ local function utilityStep()
         S.bait(st.bait)
     end
 
+    if ui.esp then
+        ui.esp.taoist(espFound.Taoist > 0 and ("found x" .. espFound.Taoist) or "not in this server")
+        ui.esp.maoshan(espFound.Maoshan > 0 and ("found x" .. espFound.Maoshan) or "not in this server")
+    end
     if ui.afk then
         if Config.AntiAFK then
             ui.afk("ON - last ping " .. fmtAgo(now - afk.last) .. " (" .. afk.pings .. ")")
@@ -1261,6 +1398,23 @@ end)
 ui.hook = infoCard({ { "next", "Next report in" }, { "status", "Last result" } })
 uiReady = true
 
+-- 🔮 ESP ------------------------------------------------------------
+section("🔮 ESP")
+toggleButton("Taoist ESP (Taoist / Grand Angler)", 28, Config.ESP_Taoist, function(v)
+    play(clickSound)
+    Config.ESP_Taoist = v
+    espLastScan = 0
+end)
+toggleButton("Maoshan ESP", 28, Config.ESP_Maoshan, function(v)
+    play(clickSound)
+    Config.ESP_Maoshan = v
+    espLastScan = 0
+end)
+do
+    local e = infoCard({ { "taoist", "Taoist" }, { "maoshan", "Maoshan" } })
+    ui.esp = { taoist = e.taoist, maoshan = e.maoshan }
+end
+
 -- status (always visible at the bottom) ------------------------------
 local StatusBox = new("Frame", {
     Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -76), BackgroundColor3 = COL_ROW, BorderSizePixel = 0,
@@ -1334,6 +1488,8 @@ local function unload()
     Config.AutoSkill = false
     Config.AutoSell = false
     Config.WebhookEnabled = false
+    Config.ESP_Taoist, Config.ESP_Maoshan = false, false
+    pcall(function() espFolder:Destroy() end)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     if cleanupIntro then pcall(cleanupIntro) end
     pcall(function() sg:Destroy() end)
