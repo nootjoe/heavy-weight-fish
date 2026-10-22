@@ -18,6 +18,8 @@
     Anti-AFK   : Player.Idled + VirtualUser (click) so Roblox does not kick you after 20 min idle
     Money stats: Data[UserId].Cash / FishCaught / FishingRod / EquippedBait
     Webhook    : executor request() -> Discord webhook (embed), interval slider 1-120 min
+    Skills     : cooldown-aware Auto Skill (Character.Skills[...].Value = cooldown, UsingSkill = casting)
+    ESP        : Taoist / Maoshan merchants (cloned into Workspace by the server), tracer + found alert
     RightControl hides / shows the window.
 ]]
 
@@ -55,6 +57,11 @@ local Config = {
     AutoCharge = true,        -- answer / press the Charge prompt
     -- skills
     AutoSkill = false,
+    SkillRoles = { Z = "Attack", X = "Attack", C = "Attack", V = "Attack" },  -- per slot: "Attack" / "Heal" / "Off"
+    HealEnabled = false,      -- use the Heal-role slots when your HP is low
+    HealBelow = 50,           -- percent of max HP
+    HoldOnInvincible = false, -- do not spend attack skills while the boss is in its invincible phase
+    BossAlert = true,         -- notify when the server announces secret bosses
     SkillMode = "Remote",     -- "Remote" = UseSkill remotes during the minigame, "Keys" = press Z/X/C/V
     -- economy
     AutoSell = false,
@@ -64,17 +71,19 @@ local Config = {
     MaterialFarming = false,  -- protect the craft-material fish from being sold
     -- utilities
     AntiAFK = true,
+    LeaveGameAFK = false,     -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
     WebhookEnabled = false,
     WebhookUrl = "",
     WebhookInterval = 15,     -- minutes between webhook reports
     ESP_Taoist = false,
     ESP_Maoshan = false,
+    ESP_Tracer = false,
+    ESP_Notify = true,
 }
 
 local DELAY_MIN, DELAY_MAX, DELAY_STEP = 0.5, 5.0, 0.1
 local SELL_MIN, SELL_MAX = 10, 300
-local SKILL_INTERVAL = 0.15   -- remote skill interval (same as the working script)
-local KEY_INTERVAL = 0.5      -- key press interval (same as the old Auto Skills Engine)
+local SKILL_INTERVAL = 0.12   -- how often the skill scheduler looks for a ready skill
 local RECAST_TIMEOUT = 15     -- line in the water this long with no bite -> cast again
 local EQUIP_INTERVAL = 1.5
 local MIN_RECAST_GAP = 1.0    -- never send two casts closer than this
@@ -85,7 +94,8 @@ local FAV_RETRY = 3.0          -- never re-send FavoriteItem for the same item s
 local FULL_SELL_GAP = 5.0      -- sell at most every 5s while the inventory is full
 local NANA_CFRAME = CFrame.new(-203.5, 7.3, 107.1)
 local SKILL_KEYS = { "Z", "X", "C", "V" }
-local KEY_CODES = { Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V }
+local KEY_CODE_OF = { Z = Enum.KeyCode.Z, X = Enum.KeyCode.X, C = Enum.KeyCode.C, V = Enum.KeyCode.V }
+local SKILL_RETRY = 0.7        -- never re-send the same skill key sooner than this (server needs time to start the cooldown)
 
 local FISH_LIST = {
     "Colossal Tigerfish", "Heavenpiercer Turtle", "Golden Guardian Fish", "Crimson Electric Eel",
@@ -114,7 +124,10 @@ local equipAttempts = 0
 local fishingStartTime = 0
 local wasFishing = false
 local lastSkillTime = 0
-local lastKeyTime = 0
+local skillCursor = 0
+local bossAlertText = "-"
+local bossNotify = function() end   -- replaced once the sounds exist
+local skillFired = { Z = 0, X = 0, C = 0, V = 0 }
 local keyBusy = false
 local lastProgressTime = 0
 local lastSlamTime = 0
@@ -187,18 +200,106 @@ local function tryEquipRod(Events, pData, now)
     end)
 end
 
-local function pressKeys()
+-- Skills --------------------------------------------------------------------------------------
+-- Confirmed in the place file: Character.Skills holds 4 NumberValues; each has the attribute "Key" (Z/X/C/V),
+--   .Value            = remaining cooldown in seconds (<= 0 means ready)
+--   :GetAttribute("UsingSkill") > 0  = this slot is locked because a skill is being cast
+-- Data[UserId].FishingRodInventory[<rod>].Skill[<key>].Value = name of the equipped skill ("" = empty slot)
+local function skillSlots(char)
+    local out = {}
+    local folder = char and char:FindFirstChild("Skills")
+    if not folder then return out end
+    for _, c in ipairs(folder:GetChildren()) do
+        if c:IsA("NumberValue") then
+            local key = c:GetAttribute("Key")
+            if type(key) == "string" then out[key] = c end
+        end
+    end
+    return out
+end
+
+local function slotSkillName(pData, key)
+    local ok, name = pcall(function()
+        local rod = pData.FishingRod.Value
+        local inv = pData.FishingRodInventory:FindFirstChild(rod)
+        local sk = inv and inv:FindFirstChild("Skill")
+        local s = sk and sk:FindFirstChild(key)
+        return s and s.Value
+    end)
+    if ok and type(name) == "string" and name ~= "" then return name end
+    return nil
+end
+
+-- Fight state, confirmed from the remote log of real boss fights:
+--   Workspace.Fishes[FishID] is a NumberValue whose .Value counts the damage dealt so far (boss HP left = MaxHealth - Value)
+--   attributes: Boss, FishName, MaxHealth, HasPhaseLeft, PhaseInvincible
+--   child  <UserId>_PlayerHealth  = your HP (max = its MaxHP attribute, otherwise Data.BaseHP)
+local function readCombat(pData)
+    local id = lp:GetAttribute("FishID")
+    local fishes = workspace:FindFirstChild("Fishes")
+    if not id or not fishes then return nil end
+    local f = fishes:FindFirstChild(tostring(id))
+    if not f then return nil end
+    local c = {
+        boss = f:GetAttribute("Boss") == true, name = f:GetAttribute("FishName"), fmax = f:GetAttribute("MaxHealth"),
+        invincible = f:GetAttribute("PhaseInvincible") == true, phaseLeft = f:GetAttribute("HasPhaseLeft") == true,
+    }
+    pcall(function() c.fdmg = f.Value end)
+    local ph = f:FindFirstChild(tostring(lp.UserId) .. "_PlayerHealth")
+    if ph then
+        c.hp = ph.Value
+        local mx = ph:GetAttribute("MaxHP")
+        if not mx and pData then
+            local b = pData:FindFirstChild("BaseHP")
+            mx = b and b.Value
+        end
+        c.hpMax = mx
+        if type(mx) == "number" and mx > 0 then c.hpFrac = c.hp / mx end
+    end
+    return c
+end
+
+-- returns the next key that can be used right now (round-robin over the Attack slots; Heal slots only when HP is low)
+local KEY_INDEX = { Z = 1, X = 2, C = 3, V = 4 }
+local function pickSkill(char, pData, now, ctx)
+    if char:GetAttribute("SkillLocked") == true then return nil end
+    local slots = skillSlots(char)
+    for _, v in pairs(slots) do
+        local using = v:GetAttribute("UsingSkill")
+        if type(using) == "number" and using > 0 then return nil end   -- a skill is being cast
+    end
+    local function ready(key)
+        local v = slots[key]
+        return Config.SkillRoles[key] ~= "Off" and v ~= nil and v.Value <= 0 and (now - skillFired[key] >= SKILL_RETRY)
+            and (not pData or slotSkillName(pData, key) ~= nil)
+    end
+    -- 1) heal when HP is low (never while the "no heal" curse is active)
+    if Config.HealEnabled and ctx and ctx.hpFrac and ctx.hpFrac * 100 < Config.HealBelow
+        and char:GetAttribute("NoHeal") ~= true then
+        for _, key in ipairs(SKILL_KEYS) do
+            if Config.SkillRoles[key] == "Heal" and ready(key) then return key, KEY_INDEX[key] end
+        end
+    end
+    -- 2) attack
+    if Config.HoldOnInvincible and ctx and ctx.invincible then return nil end
+    local n = #SKILL_KEYS
+    for i = 1, n do
+        local idx = ((skillCursor + i - 1) % n) + 1
+        local key = SKILL_KEYS[idx]
+        if Config.SkillRoles[key] == "Attack" and ready(key) then return key, idx end
+    end
+    return nil
+end
+
+local function pressKey(code)
     if keyBusy or not VIM then return end
     keyBusy = true
     task.spawn(function()
-        for _, code in ipairs(KEY_CODES) do
-            if not running or not Config.AutoSkill or Config.SkillMode ~= "Keys" then break end
-            pcall(function()
-                VIM:SendKeyEvent(true, code, false, game)
-                task.wait(0.05)
-                VIM:SendKeyEvent(false, code, false, game)
-            end)
-        end
+        pcall(function()
+            VIM:SendKeyEvent(true, code, false, game)
+            task.wait(0.05)
+            VIM:SendKeyEvent(false, code, false, game)
+        end)
         keyBusy = false
     end)
 end
@@ -522,8 +623,10 @@ end
 ---------------------------------------------------------------------
 -- ESP: Taoist / Grand Angler / Maoshan NPCs (Workspace.NPC)
 ---------------------------------------------------------------------
--- Game logic (from the reference script): the NPCs live as children of Workspace.NPC.
--- Taoist is matched by the name "Taoist" or "Grand Angler", Maoshan by the name "Maoshan".
+-- Game logic (confirmed from the place file): Taoist and Maoshan are Merchant NPCs. Their templates sit in
+-- ReplicatedStorage.Merchant.{Taoist, Maoshan} (Model + Humanoid) and the SERVER clones them into the world,
+-- so they are NOT fixed children of Workspace.NPC. "Blind Grand Angler" is a fixed NPC in Workspace.NPC.Function.
+-- We therefore watch the whole Workspace for Models that have a Humanoid and a matching name.
 local Workspace = game:GetService("Workspace")
 local ESP_SCAN_INTERVAL = 1.0      -- re-scan Workspace.NPC (NPCs can stream in / spawn later)
 local ESP_LABEL_INTERVAL = 0.15    -- distance label refresh
@@ -537,6 +640,9 @@ espFolder.Parent = Workspace
 local espTracked = {}   -- [npcInstance] = { gui, label, hl, part, kind, name }
 local espLastScan, espLastLabel = 0, 0
 local espFound = { Taoist = 0, Maoshan = 0 }
+local espAnnounced = { Taoist = false, Maoshan = false }
+local espTracerHolder = nil      -- full-screen Frame created together with the GUI
+local espNotify = function() end -- replaced once the sounds exist
 
 local function espKindOf(name)
     local n = string.lower(name)
@@ -561,6 +667,7 @@ local function espRemove(inst)
     espTracked[inst] = nil
     pcall(function() d.gui:Destroy() end)
     pcall(function() if d.hl then d.hl:Destroy() end end)
+    pcall(function() if d.line then d.line:Destroy() end end)
 end
 
 local function espAdd(inst, kind)
@@ -611,24 +718,98 @@ local function espAdd(inst, kind)
     espTracked[inst] = { gui = bb, label = lbl, hl = hl, part = part, kind = kind, name = inst.Name }
 end
 
+local espCandidates = {}   -- [model] = kind (Models with Humanoid + matching name, anywhere in Workspace)
+
+local function espConsider(inst)
+    if not inst or not inst.Parent or espCandidates[inst] then return end
+    if not inst:IsA("Model") then return end
+    local kind = espKindOf(inst.Name)
+    if not kind then return end
+    if not inst:FindFirstChildOfClass("Humanoid") then return end
+    if Players:GetPlayerFromCharacter(inst) then return end
+    espCandidates[inst] = kind
+end
+
+-- new objects: the server streams / clones them in, children arrive after the model, so check again shortly after
+conns[#conns + 1] = Workspace.DescendantAdded:Connect(function(d)
+    if not running then return end
+    if d:IsA("Model") then
+        task.delay(0.6, function() if running then espConsider(d) end end)
+    elseif d:IsA("Humanoid") then
+        local m = d.Parent
+        if m then task.delay(0.2, function() if running then espConsider(m) end end) end
+    end
+end)
+
+-- one-time initial scan of what already exists (chunked so it never freezes the game)
+task.spawn(function()
+    local n = 0
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if not running then return end
+        if d:IsA("Model") then espConsider(d) end
+        n = n + 1
+        if n % 1500 == 0 then task.wait() end
+    end
+end)
+
 local function espStep(now)
-    -- 1) periodic scan
+    -- 1) periodic bookkeeping
     if now - espLastScan >= ESP_SCAN_INTERVAL then
         espLastScan = now
         local anyOn = Config.ESP_Taoist or Config.ESP_Maoshan
-        local npcFolder = Workspace:FindFirstChild("NPC")
         espFound.Taoist, espFound.Maoshan = 0, 0
-        if npcFolder then
-            for _, n in ipairs(npcFolder:GetChildren()) do
-                local kind = espKindOf(n.Name)
-                if kind then
-                    espFound[kind] = espFound[kind] + 1
-                    if anyOn then espAdd(n, kind) end
-                end
+        for inst, kind in pairs(espCandidates) do
+            if not inst.Parent or not inst:IsDescendantOf(Workspace) then
+                espCandidates[inst] = nil
+                espRemove(inst)
+            else
+                espFound[kind] = espFound[kind] + 1
+                if anyOn then espAdd(inst, kind) end
             end
         end
         for inst, d in pairs(espTracked) do
             if not inst.Parent or not d.part.Parent then espRemove(inst) end
+        end
+        -- announce once when a merchant appears (and again after it left and came back)
+        for kind, count in pairs(espFound) do
+            if count > 0 and not espAnnounced[kind] then
+                espAnnounced[kind] = true
+                if Config.ESP_Notify then pcall(espNotify, kind) end
+            elseif count == 0 then
+                espAnnounced[kind] = false
+            end
+        end
+    end
+
+    -- tracer lines (every frame, a handful of Frames at most)
+    local camT = Workspace.CurrentCamera
+    for inst, d in pairs(espTracked) do
+        local want = Config.ESP_Tracer and Config[ESP_KINDS[d.kind].cfg] and espTracerHolder and camT
+        if want then
+            if not d.line then
+                d.line = Instance.new("Frame")
+                d.line.AnchorPoint = Vector2.new(0.5, 0.5)
+                d.line.BorderSizePixel = 0
+                d.line.BackgroundColor3 = ESP_KINDS[d.kind].color
+                d.line.BackgroundTransparency = 0.25
+                d.line.Visible = false
+                d.line.Parent = espTracerHolder
+            end
+            local pos = camT:WorldToViewportPoint(d.part.Position)
+            if pos.Z > 0 then
+                local vp = camT.ViewportSize
+                local origin = Vector2.new(vp.X / 2, vp.Y)
+                local target = Vector2.new(pos.X, pos.Y)
+                local diff = target - origin
+                d.line.Size = UDim2.fromOffset(diff.Magnitude, 2)
+                d.line.Position = UDim2.fromOffset((origin.X + target.X) / 2, (origin.Y + target.Y) / 2)
+                d.line.Rotation = math.deg(math.atan2(diff.Y, diff.X))
+                d.line.Visible = true
+            else
+                d.line.Visible = false
+            end
+        elseif d.line then
+            d.line.Visible = false
         end
     end
 
@@ -650,9 +831,106 @@ local function espStep(now)
 end
 
 -- runs every frame next to the cast engine (separate pcall, so one can't break the other)
+local lastBossUi = 0
+-- the server announces secret bosses through the chat remote, e.g. "Secret bosses have spawned at <island> | Boss Power: 82"
+task.spawn(function()
+    local ev = RS:WaitForChild("Events", 20)
+    local r = ev and ev:WaitForChild("NotifyRobloxChat", 20)
+    if not r or not running then return end
+    conns[#conns + 1] = r.OnClientEvent:Connect(function(msg)
+        if type(msg) ~= "string" then return end
+        local low = string.lower(msg)
+        if string.find(low, "secret boss", 1, true) then
+            bossAlertText = string.sub(msg, 1, 70)
+            if Config.BossAlert and running then pcall(bossNotify, msg) end
+        end
+    end)
+end)
+
+local function updateBossUi(now)
+    if not ui.boss or now - lastBossUi < 0.4 then return end
+    lastBossUi = now
+    local B = ui.boss
+    local char = lp.Character
+    local c = readCombat(getData())
+    if not c then
+        B.fight("no fight")
+        B.bhp("-"); B.myhp("-"); B.phase("-")
+    else
+        B.fight((c.boss and "BOSS  " or "") .. tostring(c.name or "?"))
+        if c.fmax and c.fdmg then
+            local left = math.max(0, c.fmax - c.fdmg)
+            B.bhp(commas(left) .. " / " .. commas(c.fmax) .. "  (" .. math.floor(left / c.fmax * 100 + 0.5) .. "%)")
+        else
+            B.bhp("?")
+        end
+        if c.hp and c.hpMax then
+            B.myhp(commas(c.hp) .. " / " .. commas(c.hpMax) .. "  (" .. math.floor((c.hpFrac or 0) * 100 + 0.5) .. "%)")
+        else
+            B.myhp(c.hp and commas(c.hp) or "?")
+        end
+        B.phase(c.invincible and "INVINCIBLE" or (c.phaseLeft and "more phases left" or "-"))
+    end
+    local flags = {}
+    if char then
+        for _, a in ipairs({ "Weakened", "Poisoned", "NoHeal", "Burned", "Bleeding", "Confused" }) do
+            if char:GetAttribute(a) == true then flags[#flags + 1] = a end
+        end
+    end
+    B.debuff(#flags > 0 and table.concat(flags, ", ") or "none")
+    B.alert(bossAlertText)
+end
+
+local lastSkillUi = 0
+local function updateSkillUi(now)
+    if not ui.skill or now - lastSkillUi < 0.4 then return end
+    lastSkillUi = now
+    local char = lp.Character
+    local slots = char and skillSlots(char) or {}
+    local pData = getData()
+    for _, key in ipairs(SKILL_KEYS) do
+        local name = pData and slotSkillName(pData, key)
+        local v = slots[key]
+        local txt
+        if not name then
+            txt = "empty slot"
+        elseif not v then
+            txt = name
+        else
+            local using = v:GetAttribute("UsingSkill")
+            if type(using) == "number" and using > 0 then
+                txt = name .. "  [casting]"
+            elseif v.Value > 0 then
+                txt = name .. "  [" .. math.ceil(v.Value) .. "s]"
+            else
+                txt = name .. "  [READY]"
+            end
+        end
+        txt = txt .. "  (" .. string.lower(Config.SkillRoles[key]) .. ")"
+        ui.skill[key](txt)
+    end
+end
+
+local afkFixLast = 0
 local function utilityStep()
     local now = tick()
     pcall(espStep, now)
+    pcall(updateSkillUi, now)
+    pcall(updateBossUi, now)
+
+    -- the game has its own AFK mode (ClientModule.AFK): 60s without key/click input -> client fires Events.AFK
+    -- and Data[UserId].AFK becomes true. VirtualUser does not produce UserInputService events, so Anti-AFK alone
+    -- does not stop it. This optional toggle fires Events.AFK again to leave that mode.
+    if Config.LeaveGameAFK and now - afkFixLast >= 5 then
+        afkFixLast = now
+        local pData = getData()
+        local v = pData and pData:FindFirstChild("AFK")
+        if v and v.Value == true and not lp:GetAttribute("ReadyToAFK") then
+            local evs = RS:FindFirstChild("Events")
+            local r = evs and evs:FindFirstChild("AFK")
+            if r then pcall(function() r:FireServer() end) end
+        end
+    end
 
     -- anti-afk keep-alive
     if Config.AntiAFK and (now - afk.last >= AFK_KEEPALIVE) then afkPing() end
@@ -696,8 +974,8 @@ local function utilityStep()
     end
 
     if ui.esp then
-        ui.esp.taoist(espFound.Taoist > 0 and ("found x" .. espFound.Taoist) or "not in this server")
-        ui.esp.maoshan(espFound.Maoshan > 0 and ("found x" .. espFound.Maoshan) or "not in this server")
+        ui.esp.taoist(espFound.Taoist > 0 and ("found x" .. espFound.Taoist) or "not spawned right now")
+        ui.esp.maoshan(espFound.Maoshan > 0 and ("found x" .. espFound.Maoshan) or "not spawned right now")
     end
     if ui.afk then
         if Config.AntiAFK then
@@ -756,21 +1034,17 @@ local function engineStep()
     ----------------------------------------------------------------
     -- Auto Skill
     ----------------------------------------------------------------
-    if Config.AutoSkill then
-        if Config.SkillMode == "Remote" then
-            if isMinigame and (now - lastSkillTime >= SKILL_INTERVAL) then
-                lastSkillTime = now
+    if Config.AutoSkill and isMinigame and (now - lastSkillTime >= SKILL_INTERVAL) then
+        lastSkillTime = now
+        local key, idx = pickSkill(char, pData, now, readCombat(pData))
+        if key then
+            skillFired[key] = now
+            skillCursor = idx
+            if Config.SkillMode == "Remote" then
                 local useSkill = Events:FindFirstChild("UseSkill")
-                local miniSkill = Events:FindFirstChild("TriggerMinigameSkill")
-                for _, sk in ipairs(SKILL_KEYS) do
-                    if useSkill then pcall(function() useSkill:FireServer(sk) end) end
-                    if miniSkill then pcall(function() miniSkill:FireServer(sk) end) end
-                end
-            end
-        else
-            if (now - lastKeyTime >= KEY_INTERVAL) and not keyBusy then
-                lastKeyTime = now
-                pressKeys()
+                if useSkill then pcall(function() useSkill:FireServer(key) end) end
+            else
+                pressKey(KEY_CODE_OF[key])
             end
         end
     end
@@ -953,11 +1227,15 @@ end
 ---------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------
-local COL_BG = Color3.fromRGB(15, 15, 17)
-local COL_ROW = Color3.fromRGB(20, 20, 25)
+local COL_CARD = Color3.fromRGB(21, 24, 33)
+local COL_ROW = Color3.fromRGB(30, 34, 46)
+local COL_STROKE = Color3.fromRGB(44, 50, 66)
 local COL_GREEN = Color3.fromRGB(0, 255, 150)
-local COL_ON = Color3.fromRGB(0, 150, 80)
-local COL_OFF = Color3.fromRGB(150, 0, 0)
+local COL_ON = Color3.fromRGB(0, 190, 105)
+local COL_OFF = Color3.fromRGB(66, 70, 88)
+local COL_RED = Color3.fromRGB(200, 60, 60)
+local COL_TEXT2 = Color3.fromRGB(140, 148, 165)
+local COL_TABON = Color3.fromRGB(0, 62, 42)
 
 local function new(class, props, parent)
     local inst = Instance.new(class)
@@ -995,8 +1273,11 @@ local function attachGui(gui)
     gui.Parent = lp:WaitForChild("PlayerGui")
 end
 
-local sg = new("ScreenGui", { Name = "PPINGYYY_AutoFish", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+local sg = new("ScreenGui", {
+    Name = "PPINGYYY_AutoFish", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = true,
+})
 attachGui(sg)
+espTracerHolder = new("Frame", { Name = "Tracers", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Active = false }, sg)
 
 local function makeSound(id)
     local s = new("Sound", { Volume = 1 }, sg)
@@ -1010,45 +1291,68 @@ local sellSound = makeSound("90531793028786")
 local deleteSound = makeSound("154157386")
 local function play(s) pcall(function() s:Play() end) end
 
-local FULL_SIZE = UDim2.new(0, 360, 0, 480)
-local MIN_SIZE = UDim2.new(0, 360, 0, 40)
+bossNotify = function(msg)
+    play(skillSound)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = "Secret boss!", Text = msg, Duration = 10 })
+    end)
+end
+
+espNotify = function(kind)
+    play(skillSound)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = kind .. " found!", Text = "A " .. kind .. " merchant is in this server.", Duration = 8,
+        })
+    end)
+end
+
+local FULL_SIZE = UDim2.new(0, 390, 0, 560)
+local MIN_SIZE = UDim2.new(0, 390, 0, 46)
 
 local Main = new("Frame", {
     Size = FULL_SIZE, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
-    BackgroundColor3 = COL_BG, BorderSizePixel = 0, ClipsDescendants = true,
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ClipsDescendants = true,
 }, sg)
-corner(Main, 10)
-new("UIStroke", { Color = COL_GREEN, Thickness = 1.5 }, Main)
+corner(Main, 12)
+new("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(19, 22, 31), Color3.fromRGB(10, 11, 15)), Rotation = 90 }, Main)
+new("UIStroke", { Color = COL_GREEN, Thickness = 1.5, Transparency = 0.2 }, Main)
 
-local TitleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1 }, Main)
+local TitleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundTransparency = 1 }, Main)
 new("TextLabel", {
-    Size = UDim2.new(1, -80, 1, 0), Position = UDim2.new(0, 12, 0, 0), BackgroundTransparency = 1,
-    Text = "★ PPINGYYY AUTO FISH ★", TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 14,
+    Size = UDim2.new(1, -90, 0, 22), Position = UDim2.new(0, 14, 0, 6), BackgroundTransparency = 1,
+    Text = "★ PPINGYYY AUTO FISH", TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 15,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, TitleBar)
+new("TextLabel", {
+    Size = UDim2.new(1, -90, 0, 14), Position = UDim2.new(0, 14, 0, 27), BackgroundTransparency = 1,
+    Text = "4896 Polar Bear  •  Heavyweight Fishing", TextColor3 = COL_TEXT2, Font = Enum.Font.Gotham, TextSize = 10,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, TitleBar)
 
 local CloseBtn = new("TextButton", {
-    Size = UDim2.new(0, 25, 0, 25), Position = UDim2.new(1, -35, 0, 8), Text = "X", Font = Enum.Font.GothamBold,
-    TextSize = 12, BackgroundColor3 = COL_OFF, TextColor3 = Color3.new(1, 1, 1),
+    Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -38, 0, 10), Text = "✕", Font = Enum.Font.GothamBold,
+    TextSize = 12, BackgroundColor3 = COL_RED, TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = true,
 }, TitleBar)
-corner(CloseBtn, 5)
+corner(CloseBtn, 6)
 
 local MinBtn = new("TextButton", {
-    Size = UDim2.new(0, 25, 0, 25), Position = UDim2.new(1, -65, 0, 8), Text = "—", Font = Enum.Font.GothamBold,
-    TextSize = 12, BackgroundColor3 = Color3.fromRGB(0, 100, 200), TextColor3 = Color3.new(1, 1, 1),
+    Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -70, 0, 10), Text = "—", Font = Enum.Font.GothamBold,
+    TextSize = 12, BackgroundColor3 = Color3.fromRGB(40, 90, 190), TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = true,
 }, TitleBar)
-corner(MinBtn, 5)
+corner(MinBtn, 6)
 
--- scrolling body (all the controls) ----------------------------------
-local Body = new("ScrollingFrame", {
-    Size = UDim2.new(1, 0, 1, -122), Position = UDim2.new(0, 0, 0, 40), BackgroundTransparency = 1,
-    BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+-- content area: tab bar + one scrolling page per tab ---------------------------------------
+local Content = new("Frame", {
+    Size = UDim2.new(1, 0, 1, -130), Position = UDim2.new(0, 0, 0, 46), BackgroundTransparency = 1,
 }, Main)
-new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, Body)
-new("UIPadding", {
-    PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 14), PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 8),
-}, Body)
+local TabBar = new("Frame", { Size = UDim2.new(1, -20, 0, 32), Position = UDim2.new(0, 10, 0, 2), BackgroundTransparency = 1 }, Content)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, TabBar)
+local Pages = new("Frame", { Size = UDim2.new(1, 0, 1, -38), Position = UDim2.new(0, 0, 0, 38), BackgroundTransparency = 1 }, Content)
+
+local pages, tabButtons = {}, {}
+local Body = nil     -- the container the widget helpers below put their controls into (a card)
+local Page = nil     -- the page that new cards are added to
 
 local orderCounter = 0
 local function nextOrder()
@@ -1056,40 +1360,129 @@ local function nextOrder()
     return orderCounter
 end
 
-local function section(text)
-    return new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, LayoutOrder = nextOrder(),
-        Text = text, TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }, Body)
+local function selectTab(name)
+    for n, pg in pairs(pages) do pg.Visible = (n == name) end
+    for n, tb in pairs(tabButtons) do
+        local on = (n == name)
+        TweenService:Create(tb.btn, TweenInfo.new(0.15), {
+            BackgroundColor3 = on and COL_TABON or COL_ROW, TextColor3 = on and COL_GREEN or COL_TEXT2,
+        }):Play()
+        tb.line.Visible = on
+    end
 end
 
-local function toggleButton(label, h, initial, onChange)
-    local state = initial
+local function addTab(name, label, order)
     local btn = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, h), LayoutOrder = nextOrder(), Font = Enum.Font.GothamBold,
-        TextSize = 11, TextColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
-    }, Body)
-    corner(btn, 6)
-    local function refresh()
-        btn.Text = label .. ": " .. (state and "ON" or "OFF")
-        btn.BackgroundColor3 = state and COL_ON or COL_OFF
-    end
-    refresh()
+        Size = UDim2.new(0.2, -3.2, 1, 0), LayoutOrder = order, Text = label, Font = Enum.Font.GothamBold, TextSize = 10,
+        BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, BorderSizePixel = 0, AutoButtonColor = false,
+    }, TabBar)
+    corner(btn, 7)
+    local line = new("Frame", {
+        Size = UDim2.new(1, -16, 0, 2), Position = UDim2.new(0, 8, 1, -4), BackgroundColor3 = COL_GREEN,
+        BorderSizePixel = 0, Visible = false,
+    }, btn)
+    corner(line, 1)
+    local page = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+        ScrollBarImageColor3 = COL_GREEN, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false,
+    }, Pages)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10) }, page)
+    new("UIPadding", {
+        PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 14), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10),
+    }, page)
+    pages[name] = page
+    tabButtons[name] = { btn = btn, line = line }
     btn.MouseButton1Click:Connect(function()
+        play(clickSound)
+        selectTab(name)
+    end)
+end
+
+addTab("Fish", "🎣 Fish", 1)
+addTab("Skill", "⚡ Skill", 2)
+addTab("Sell", "💰 Sell", 3)
+addTab("Stats", "📊 Stats", 4)
+addTab("Misc", "⚙ Misc", 5)
+
+local function setPage(name)
+    Page = pages[name]
+    Body = Page
+end
+
+-- a titled card; every widget created afterwards goes into it
+local function section(text)
+    local card = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = COL_CARD,
+        BorderSizePixel = 0, LayoutOrder = nextOrder(),
+    }, Page)
+    corner(card, 10)
+    new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, card)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, card)
+    new("UIPadding", {
+        PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
+    }, card)
+    local head = new("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, card)
+    local bar = new("Frame", {
+        Size = UDim2.new(0, 3, 0, 14), Position = UDim2.new(0, 0, 0.5, -7), BackgroundColor3 = COL_GREEN, BorderSizePixel = 0,
+    }, head)
+    corner(bar, 2)
+    new("TextLabel", {
+        Size = UDim2.new(1, -10, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1, Text = text,
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+    }, head)
+    Body = card
+    return card
+end
+
+-- switch row: label on the left, pill switch on the right
+local function toggleButton(label, h, initial, onChange)
+    local state = initial and true or false
+    local row = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, math.max(h, 30)), LayoutOrder = nextOrder(), BackgroundColor3 = COL_ROW,
+        BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+    }, Body)
+    corner(row, 7)
+    new("TextLabel", {
+        Size = UDim2.new(1, -62, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1, Text = label,
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamMedium, TextSize = 11, TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+    local pill = new("Frame", {
+        Size = UDim2.new(0, 38, 0, 20), Position = UDim2.new(1, -48, 0.5, -10), BackgroundColor3 = COL_OFF, BorderSizePixel = 0,
+    }, row)
+    corner(pill, 10)
+    local knob = new("Frame", {
+        Size = UDim2.new(0, 16, 0, 16), Position = UDim2.new(0, 2, 0.5, -8), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+    }, pill)
+    corner(knob, 8)
+    local function refresh(animate)
+        local pos = state and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+        local col = state and COL_ON or COL_OFF
+        if animate then
+            TweenService:Create(knob, TweenInfo.new(0.12), { Position = pos }):Play()
+            TweenService:Create(pill, TweenInfo.new(0.12), { BackgroundColor3 = col }):Play()
+        else
+            knob.Position = pos
+            pill.BackgroundColor3 = col
+        end
+    end
+    refresh(false)
+    row.MouseButton1Click:Connect(function()
         state = not state
-        refresh()
+        refresh(true)
         onChange(state)
     end)
-    return btn
+    return row
 end
 
 local function actionButton(text, h, onClick)
     local btn = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, h), LayoutOrder = nextOrder(), Font = Enum.Font.GothamBold, TextSize = 11,
-        Text = text, BackgroundColor3 = Color3.fromRGB(20, 30, 40), TextColor3 = COL_GREEN, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, math.max(h, 28)), LayoutOrder = nextOrder(), Font = Enum.Font.GothamBold, TextSize = 11,
+        Text = text, BackgroundColor3 = Color3.fromRGB(24, 40, 48), TextColor3 = COL_GREEN, BorderSizePixel = 0,
     }, Body)
-    corner(btn, 6)
+    corner(btn, 7)
+    new("UIStroke", { Color = Color3.fromRGB(0, 110, 75), Thickness = 1 }, btn)
     btn.MouseButton1Click:Connect(onClick)
     return btn
 end
@@ -1225,6 +1618,33 @@ local function makeDropdown(title, options, initial, onPick)
     refresh()
 end
 
+-- generic info card (label on the left, value on the right) -------------
+local function infoCard(rows, labelFrac)
+    labelFrac = labelFrac or 0.45
+    local card = new("Frame", {
+        Size = UDim2.new(1, 0, 0, #rows * 22 + 8), BackgroundColor3 = COL_ROW, BorderSizePixel = 0, LayoutOrder = nextOrder(),
+    }, Body)
+    corner(card, 6)
+    local setters = {}
+    for i, r in ipairs(rows) do
+        local y = 4 + (i - 1) * 22
+        new("TextLabel", {
+            Size = UDim2.new(labelFrac, -8, 0, 22), Position = UDim2.new(0, 8, 0, y), BackgroundTransparency = 1, Text = r[2],
+            TextColor3 = Color3.fromRGB(150, 150, 150), Font = Enum.Font.Gotham, TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, card)
+        local v = new("TextLabel", {
+            Size = UDim2.new(1 - labelFrac, -8, 0, 22), Position = UDim2.new(labelFrac, 0, 0, y), BackgroundTransparency = 1, Text = "-",
+            TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, card)
+        setters[r[1]] = function(text) v.Text = text end
+    end
+    return setters
+end
+
+-- tab: Fish ----------------------------------------------------------
+setPage("Fish")
 -- 🎣 Auto Cast ------------------------------------------------------
 section("🎣 AUTO CAST")
 toggleButton("Auto Cast Rod", 32, Config.AutoCast, function(v)
@@ -1256,9 +1676,12 @@ toggleButton("Auto Charge Durability", 28, Config.AutoCharge, function(v)
     Config.AutoCharge = v
 end)
 
+-- tab: Skill ---------------------------------------------------------
+setPage("Skill")
+do
 -- ⚡ Auto Skill ------------------------------------------------------
 section("⚡ AUTO SKILL")
-toggleButton("AUTO SKILL", 32, Config.AutoSkill, function(v)
+toggleButton("AUTO SKILL (uses every ready skill)", 32, Config.AutoSkill, function(v)
     play(skillSound)
     Config.AutoSkill = v
 end)
@@ -1266,9 +1689,9 @@ local ModeBtn = actionButton("", 28, function() end)
 ModeBtn.TextSize = 10
 local function refreshMode()
     if Config.SkillMode == "Remote" then
-        ModeBtn.Text = "Mode: Remote (UseSkill, only while reeling)  [click to change]"
+        ModeBtn.Text = "Mode: Remote (UseSkill)  [click to change]"
     else
-        ModeBtn.Text = "Mode: Keys Z/X/C/V (always)  [click to change]"
+        ModeBtn.Text = "Mode: Keys Z/X/C/V  [click to change]"
     end
 end
 refreshMode()
@@ -1278,6 +1701,64 @@ ModeBtn.MouseButton1Click:Connect(function()
     refreshMode()
 end)
 
+-- role of every slot: Attack -> Heal -> Off
+local ROLE_NEXT = { Attack = "Heal", Heal = "Off", Off = "Attack" }
+local ROLE_COLOR = { Attack = Color3.fromRGB(190, 70, 60), Heal = Color3.fromRGB(0, 150, 110), Off = COL_OFF }
+local keyRow = new("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, Body)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, keyRow)
+for i, key in ipairs(SKILL_KEYS) do
+    local kb = new("TextButton", {
+        Size = UDim2.new(0.25, -4.5, 1, 0), LayoutOrder = i, Font = Enum.Font.GothamBold, TextSize = 10,
+        BorderSizePixel = 0, TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = false,
+    }, keyRow)
+    corner(kb, 7)
+    local function refreshKey()
+        local role = Config.SkillRoles[key]
+        kb.Text = key .. "\n" .. string.upper(role)
+        kb.BackgroundColor3 = ROLE_COLOR[role]
+    end
+    refreshKey()
+    kb.MouseButton1Click:Connect(function()
+        play(clickSound)
+        Config.SkillRoles[key] = ROLE_NEXT[Config.SkillRoles[key]]
+        refreshKey()
+    end)
+end
+
+-- live slot status
+do
+    local e = infoCard({ { "Z", "Key Z" }, { "X", "Key X" }, { "C", "Key C" }, { "V", "Key V" } }, 0.2)
+    ui.skill = e
+end
+
+-- boss / combat -------------------------------------------------------
+section("⚔ BOSS & COMBAT")
+toggleButton("Use Heal slots when HP is low", 30, Config.HealEnabled, function(v)
+    play(clickSound)
+    Config.HealEnabled = v
+end)
+makeSlider("Heal below", "%", 10, 90, 5, 5, 0, Config.HealBelow, function(v)
+    Config.HealBelow = v
+end)
+toggleButton("Hold attacks while boss is invincible", 30, Config.HoldOnInvincible, function(v)
+    play(clickSound)
+    Config.HoldOnInvincible = v
+end)
+toggleButton("Alert when secret bosses spawn", 30, Config.BossAlert, function(v)
+    play(clickSound)
+    Config.BossAlert = v
+end)
+do
+    ui.boss = infoCard({
+        { "fight", "Fight" }, { "bhp", "Boss HP" }, { "myhp", "My HP" }, { "phase", "Phase" },
+        { "debuff", "Debuffs" }, { "alert", "Last alert" },
+    }, 0.3)
+end
+
+end
+
+-- tab: Sell ----------------------------------------------------------
+setPage("Sell")
 -- 💰 Economy & Selling -----------------------------------------------
 section("💰 ECONOMY & SELLING")
 toggleButton("Auto Sell Fish", 32, Config.AutoSell, function(v)
@@ -1303,39 +1784,9 @@ toggleButton("Material Farming (protect craft fish)", 28, Config.MaterialFarming
     Config.MaterialFarming = v
 end)
 
--- generic info card (label on the left, value on the right) -------------
-local function infoCard(rows)
-    local card = new("Frame", {
-        Size = UDim2.new(1, 0, 0, #rows * 22 + 8), BackgroundColor3 = COL_ROW, BorderSizePixel = 0, LayoutOrder = nextOrder(),
-    }, Body)
-    corner(card, 6)
-    local setters = {}
-    for i, r in ipairs(rows) do
-        local y = 4 + (i - 1) * 22
-        new("TextLabel", {
-            Size = UDim2.new(0.45, -8, 0, 22), Position = UDim2.new(0, 8, 0, y), BackgroundTransparency = 1, Text = r[2],
-            TextColor3 = Color3.fromRGB(150, 150, 150), Font = Enum.Font.Gotham, TextSize = 11,
-            TextXAlignment = Enum.TextXAlignment.Left,
-        }, card)
-        local v = new("TextLabel", {
-            Size = UDim2.new(0.55, -8, 0, 22), Position = UDim2.new(0.45, 0, 0, y), BackgroundTransparency = 1, Text = "-",
-            TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
-            TextTruncate = Enum.TextTruncate.AtEnd,
-        }, card)
-        setters[r[1]] = function(text) v.Text = text end
-    end
-    return setters
-end
-
--- 🛡️ Anti AFK ----------------------------------------------------------
-section("🛡️ ANTI AFK")
-toggleButton("Anti-AFK (prevents the 20 min idle kick)", 28, Config.AntiAFK, function(v)
-    play(clickSound)
-    Config.AntiAFK = v
-    markDirty()
-end)
-ui.afk = infoCard({ { "afk", "Status" } }).afk
-
+-- tab: Stats ---------------------------------------------------------
+setPage("Stats")
+do
 -- 📊 Money Stats --------------------------------------------------------
 section("📊 MONEY STATS")
 ui.stats = infoCard({
@@ -1398,6 +1849,23 @@ end)
 ui.hook = infoCard({ { "next", "Next report in" }, { "status", "Last result" } })
 uiReady = true
 
+end
+
+-- tab: Misc ----------------------------------------------------------
+setPage("Misc")
+-- 🛡️ Anti AFK ----------------------------------------------------------
+section("🛡️ ANTI AFK")
+toggleButton("Anti-AFK (prevents the 20 min idle kick)", 28, Config.AntiAFK, function(v)
+    play(clickSound)
+    Config.AntiAFK = v
+    markDirty()
+end)
+toggleButton("Leave game's AFK mode automatically", 28, Config.LeaveGameAFK, function(v)
+    play(clickSound)
+    Config.LeaveGameAFK = v
+end)
+ui.afk = infoCard({ { "afk", "Status" } }).afk
+
 -- 🔮 ESP ------------------------------------------------------------
 section("🔮 ESP")
 toggleButton("Taoist ESP (Taoist / Grand Angler)", 28, Config.ESP_Taoist, function(v)
@@ -1410,16 +1878,27 @@ toggleButton("Maoshan ESP", 28, Config.ESP_Maoshan, function(v)
     Config.ESP_Maoshan = v
     espLastScan = 0
 end)
+toggleButton("Tracer line to the NPC", 28, Config.ESP_Tracer, function(v)
+    play(clickSound)
+    Config.ESP_Tracer = v
+end)
+toggleButton("Alert when one appears", 28, Config.ESP_Notify, function(v)
+    play(clickSound)
+    Config.ESP_Notify = v
+end)
 do
     local e = infoCard({ { "taoist", "Taoist" }, { "maoshan", "Maoshan" } })
     ui.esp = { taoist = e.taoist, maoshan = e.maoshan }
 end
 
+selectTab("Fish")
+
 -- status (always visible at the bottom) ------------------------------
 local StatusBox = new("Frame", {
-    Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -76), BackgroundColor3 = COL_ROW, BorderSizePixel = 0,
+    Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -76), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
 }, Main)
-corner(StatusBox, 6)
+corner(StatusBox, 10)
+new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, StatusBox)
 local StatusLabel = new("TextLabel", {
     Size = UDim2.new(1, -16, 0, 34), Position = UDim2.new(0, 8, 0, 4), BackgroundTransparency = 1, Text = "Status: ...",
     TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11, TextWrapped = true,
@@ -1463,7 +1942,7 @@ MinBtn.MouseButton1Click:Connect(function()
     play(clickSound)
     minimized = not minimized
     if minimized then
-        Body.Visible = false
+        Content.Visible = false
         StatusBox.Visible = false
         TweenService:Create(Main, TweenInfo.new(0.2), { Size = MIN_SIZE }):Play()
         MinBtn.Text = "+"
@@ -1471,7 +1950,7 @@ MinBtn.MouseButton1Click:Connect(function()
         TweenService:Create(Main, TweenInfo.new(0.2), { Size = FULL_SIZE }):Play()
         task.delay(0.2, function()
             if running and not minimized then
-                Body.Visible = true
+                Content.Visible = true
                 StatusBox.Visible = true
             end
         end)
@@ -1513,6 +1992,7 @@ end)
 -- Intro animation: "4896 Polar Bear"
 -- (set getgenv().PP_ShowIntro = false before running to disable it; click / tap skips it)
 ---------------------------------------------------------------------
+do  -- (scoped: keeps the number of top-level locals low)
 local INTRO_TEXT = "4896 Polar Bear"
 local SHOW_INTRO = (env.PP_ShowIntro ~= false)
 local introGui, introBlur = nil, nil
@@ -1751,11 +2231,13 @@ if SHOW_INTRO then
         if not ok then warn("[PPINGYYY AutoFish] intro error: " .. tostring(err)) end
         cleanupIntro()
         if running then
-            Main.Size = UDim2.new(0, 360, 0, 0)
+            Main.Size = UDim2.new(0, 390, 0, 0)
             Main.Visible = true
             TweenService:Create(Main, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = FULL_SIZE }):Play()
         end
     end)
+end
+
 end
 
 ---------------------------------------------------------------------
@@ -1795,4 +2277,4 @@ pcall(function()
         Duration = 4,
     })
 end)
-print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v3 loaded (Auto Cast + Anchor Bar + Skill + Economy + Anti-AFK + Stats + Webhook)")
+print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v5 loaded (Auto Cast + Anchor Bar + Skill + Boss logic + Economy + Anti-AFK + Stats + Webhook + ESP)")
