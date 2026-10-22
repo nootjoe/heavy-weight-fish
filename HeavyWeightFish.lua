@@ -60,7 +60,7 @@ local Config = {
     SkillRoles = { Z = "Attack", X = "Attack", C = "Attack", V = "Attack" },  -- per slot: "Attack" / "Heal" / "Off"
     HealEnabled = false,      -- use the Heal-role slots when your HP is low
     HealBelow = 50,           -- percent of max HP
-    HoldOnInvincible = false, -- do not spend attack skills while the boss is in its invincible phase
+    HoldOnInvincible = true,  -- do not spend attack skills while the boss is invincible (~3 s after it restores its HP)
     BossAlert = true,         -- notify when the server announces secret bosses
     SkillMode = "Remote",     -- "Remote" = UseSkill remotes during the minigame, "Keys" = press Z/X/C/V
     -- economy
@@ -126,6 +126,7 @@ local wasFishing = false
 local lastSkillTime = 0
 local skillCursor = 0
 local bossAlertText = "-"
+local gameAfkText, gameAfkTime = "", -100
 local bossNotify = function() end   -- replaced once the sounds exist
 local skillFired = { Z = 0, X = 0, C = 0, V = 0 }
 local keyBusy = false
@@ -273,9 +274,9 @@ local function pickSkill(char, pData, now, ctx)
         return Config.SkillRoles[key] ~= "Off" and v ~= nil and v.Value <= 0 and (now - skillFired[key] >= SKILL_RETRY)
             and (not pData or slotSkillName(pData, key) ~= nil)
     end
-    -- 1) heal when HP is low (never while the "no heal" curse is active)
+    -- 1) heal when HP is low (never while the "can't heal" curse is active: the game sets the character attribute Poisoned)
     if Config.HealEnabled and ctx and ctx.hpFrac and ctx.hpFrac * 100 < Config.HealBelow
-        and char:GetAttribute("NoHeal") ~= true then
+        and char:GetAttribute("Poisoned") ~= true and char:GetAttribute("NoHeal") ~= true then
         for _, key in ipairs(SKILL_KEYS) do
             if Config.SkillRoles[key] == "Heal" and ready(key) then return key, KEY_INDEX[key] end
         end
@@ -843,6 +844,25 @@ task.spawn(function()
         if string.find(low, "secret boss", 1, true) then
             bossAlertText = string.sub(msg, 1, 70)
             if Config.BossAlert and running then pcall(bossNotify, msg) end
+        elseif string.find(low, "taoist", 1, true) or string.find(low, "maoshan", 1, true) then
+            -- the server announces the merchants too (e.g. "Taoist has left!")
+            bossAlertText = string.sub(msg, 1, 70)
+            if Config.ESP_Notify and running and not string.find(low, "left", 1, true) then
+                pcall(bossNotify, msg, "Merchant announcement")
+            end
+        end
+    end)
+end)
+
+-- the game's own AFK mode: Events.AFK sends a countdown text every second ("Rejoin in 900s ...")
+task.spawn(function()
+    local ev = RS:WaitForChild("Events", 20)
+    local r = ev and ev:WaitForChild("AFK", 20)
+    if not r or not running then return end
+    conns[#conns + 1] = r.OnClientEvent:Connect(function(txt)
+        if type(txt) == "string" then
+            gameAfkText = txt
+            gameAfkTime = tick()
         end
     end)
 end)
@@ -978,11 +998,11 @@ local function utilityStep()
         ui.esp.maoshan(espFound.Maoshan > 0 and ("found x" .. espFound.Maoshan) or "not spawned right now")
     end
     if ui.afk then
-        if Config.AntiAFK then
-            ui.afk("ON - last ping " .. fmtAgo(now - afk.last) .. " (" .. afk.pings .. ")")
-        else
-            ui.afk("OFF")
+        local txt = Config.AntiAFK and ("ON - last ping " .. fmtAgo(now - afk.last) .. " (" .. afk.pings .. ")") or "OFF"
+        if now - gameAfkTime < 3 then
+            txt = txt .. "  |  GAME AFK MODE: " .. string.gsub(gameAfkText, " %(Press again to stop afk%)", "")
         end
+        ui.afk(txt)
     end
     if ui.hook then
         if Config.WebhookEnabled then
@@ -1291,10 +1311,10 @@ local sellSound = makeSound("90531793028786")
 local deleteSound = makeSound("154157386")
 local function play(s) pcall(function() s:Play() end) end
 
-bossNotify = function(msg)
+bossNotify = function(msg, title)
     play(skillSound)
     pcall(function()
-        StarterGui:SetCore("SendNotification", { Title = "Secret boss!", Text = msg, Duration = 10 })
+        StarterGui:SetCore("SendNotification", { Title = title or "Secret boss!", Text = msg, Duration = 10 })
     end)
 end
 
@@ -1740,7 +1760,7 @@ end)
 makeSlider("Heal below", "%", 10, 90, 5, 5, 0, Config.HealBelow, function(v)
     Config.HealBelow = v
 end)
-toggleButton("Hold attacks while boss is invincible", 30, Config.HoldOnInvincible, function(v)
+toggleButton("Hold attacks while boss is invincible (~3s)", 30, Config.HoldOnInvincible, function(v)
     play(clickSound)
     Config.HoldOnInvincible = v
 end)
@@ -1860,11 +1880,11 @@ toggleButton("Anti-AFK (prevents the 20 min idle kick)", 28, Config.AntiAFK, fun
     Config.AntiAFK = v
     markDirty()
 end)
-toggleButton("Leave game's AFK mode automatically", 28, Config.LeaveGameAFK, function(v)
+toggleButton("Leave game AFK mode automatically (else it rejoins you after 15 min)", 34, Config.LeaveGameAFK, function(v)
     play(clickSound)
     Config.LeaveGameAFK = v
 end)
-ui.afk = infoCard({ { "afk", "Status" } }).afk
+ui.afk = infoCard({ { "afk", "Status" } }, 0.17).afk
 
 -- 🔮 ESP ------------------------------------------------------------
 section("🔮 ESP")
