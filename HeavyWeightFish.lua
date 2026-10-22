@@ -20,6 +20,7 @@
     Webhook    : executor request() -> Discord webhook (embed), interval slider 1-120 min
     Skills     : cooldown-aware Auto Skill (Character.Skills[...].Value = cooldown, UsingSkill = casting)
     ESP        : Taoist / Maoshan merchants (cloned into Workspace by the server), tracer + found alert
+    Performance: black screen (3D rendering off), low graphics, no particles, mute, FPS cap  (RightShift = black screen)
     RightControl hides / shows the window.
 ]]
 
@@ -61,6 +62,7 @@ local Config = {
     HealEnabled = false,      -- use the Heal-role slots when your HP is low
     HealBelow = 50,           -- percent of max HP
     HoldOnInvincible = true,  -- do not spend attack skills while the boss is invincible (~3 s after it restores its HP)
+    FpsCap = 30,              -- used by "Limit FPS"
     BossAlert = true,         -- notify when the server announces secret bosses
     SkillMode = "Remote",     -- "Remote" = UseSkill remotes during the minigame, "Keys" = press Z/X/C/V
     -- economy
@@ -854,6 +856,215 @@ task.spawn(function()
     end)
 end)
 
+-- Performance saver ------------------------------------------------------------------------
+-- Everything here is reversible: the original values are remembered and restored when a switch is turned off
+-- (or when the script is closed).
+local perf = { black = false, lowgfx = false, nofx = false, mute = false, fps = false, tick = nil }
+do
+    local Lighting = game:GetService("Lighting")
+    local saved = setmetatable({}, { __mode = "k" })   -- [instance] = { property = original value }
+    local g = {}                                        -- single saved values (quality level, volume, fps cap)
+    local fxConn, fxToken = nil, 0
+    local overlay, hudLabel = nil, nil
+    local lastReapply, lastHud = 0, 0
+
+    local function setProp(inst, prop, value)
+        pcall(function()
+            local s = saved[inst]
+            if not s then s = {}; saved[inst] = s end
+            if s[prop] == nil then s[prop] = inst[prop] end
+            inst[prop] = value
+        end)
+    end
+    local function restoreProps(filter)
+        for inst, props in pairs(saved) do
+            if filter(inst) then
+                for prop, v in pairs(props) do pcall(function() inst[prop] = v end) end
+                saved[inst] = nil
+            end
+        end
+    end
+
+    -- low graphics -----------------------------------------------------------------------
+    local function lowGfx(on)
+        if on then
+            pcall(function()
+                local r = settings().Rendering
+                if g.quality == nil then g.quality = r.QualityLevel end
+                r.QualityLevel = Enum.QualityLevel.Level01
+            end)
+            setProp(Lighting, "GlobalShadows", false)
+            for _, e in ipairs(Lighting:GetChildren()) do
+                if e:IsA("PostEffect") then
+                    setProp(e, "Enabled", false)
+                elseif e:IsA("Atmosphere") then
+                    setProp(e, "Density", 0)
+                    setProp(e, "Haze", 0)
+                end
+            end
+            local terrain = Workspace:FindFirstChildOfClass("Terrain")
+            if terrain then
+                setProp(terrain, "Decoration", false)
+                setProp(terrain, "WaterWaveSize", 0)
+                setProp(terrain, "WaterWaveSpeed", 0)
+                setProp(terrain, "WaterReflectance", 0)
+            end
+        else
+            restoreProps(function(i)
+                return i == Lighting or i:IsA("PostEffect") or i:IsA("Atmosphere") or i:IsA("Terrain")
+            end)
+            if g.quality ~= nil then
+                pcall(function() settings().Rendering.QualityLevel = g.quality end)
+                g.quality = nil
+            end
+        end
+    end
+
+    -- particles / beams / trails / lights -------------------------------------------------
+    local FX = {
+        ParticleEmitter = true, Beam = true, Trail = true, Smoke = true, Fire = true, Sparkles = true,
+        PointLight = true, SpotLight = true, SurfaceLight = true,
+    }
+    local function killFx(d)
+        if FX[d.ClassName] and not d:IsDescendantOf(espFolder) then setProp(d, "Enabled", false) end
+    end
+    local function noFx(on)
+        fxToken = fxToken + 1
+        if fxConn then fxConn:Disconnect(); fxConn = nil end
+        if on then
+            local token = fxToken
+            fxConn = Workspace.DescendantAdded:Connect(killFx)
+            task.spawn(function()   -- chunked so the game never freezes
+                local n = 0
+                for _, d in ipairs(Workspace:GetDescendants()) do
+                    if token ~= fxToken or not running then return end
+                    killFx(d)
+                    n = n + 1
+                    if n % 2000 == 0 then task.wait() end
+                end
+            end)
+        else
+            restoreProps(function(i) return FX[i.ClassName] == true end)
+        end
+    end
+
+    -- audio ---------------------------------------------------------------------------------
+    local function mute(on)
+        return pcall(function()
+            local gs = UserSettings():GetService("UserGameSettings")
+            if on then
+                if g.volume == nil then g.volume = gs.MasterVolume end
+                gs.MasterVolume = 0
+            elseif g.volume ~= nil then
+                gs.MasterVolume = g.volume
+                g.volume = nil
+            end
+        end)
+    end
+
+    -- fps cap (executor function) ---------------------------------------------------------
+    local function fpsCap(on, n)
+        if not setfpscap then return false end
+        if g.fps == nil then
+            local cur = nil
+            if getfpscap then pcall(function() cur = getfpscap() end) end
+            g.fps = (type(cur) == "number" and cur > 0) and cur or 60
+        end
+        return pcall(function() setfpscap(on and n or g.fps) end)
+    end
+
+    -- black screen ---------------------------------------------------------------------------
+    local function attach(gui)
+        for _, getter in ipairs({ function() return gethui and gethui() end, function() return game:GetService("CoreGui") end }) do
+            local ok, parent = pcall(getter)
+            if ok and parent then
+                local ok2 = pcall(function() gui.Parent = parent end)
+                if ok2 and gui.Parent == parent then return end
+            end
+        end
+        gui.Parent = lp:WaitForChild("PlayerGui")
+    end
+    local function black(on)
+        if on then
+            if not overlay then
+                overlay = Instance.new("ScreenGui")
+                overlay.Name = "PPINGYYY_BlackScreen"
+                overlay.ResetOnSpawn = false
+                overlay.IgnoreGuiInset = true
+                overlay.DisplayOrder = 5      -- above the game UI, below this script's window (DisplayOrder 10)
+                overlay.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+                attach(overlay)
+                local f = Instance.new("Frame")
+                f.Size = UDim2.new(1, 0, 1, 0)
+                f.BackgroundColor3 = Color3.new(0, 0, 0)
+                f.BorderSizePixel = 0
+                f.Active = true               -- swallows clicks so nothing in the game is hit by accident
+                f.Parent = overlay
+                hudLabel = Instance.new("TextLabel")
+                hudLabel.AnchorPoint = Vector2.new(0.5, 1)
+                hudLabel.Position = UDim2.new(0.5, 0, 1, -40)
+                hudLabel.Size = UDim2.new(0, 520, 0, 150)
+                hudLabel.BackgroundTransparency = 1
+                hudLabel.TextColor3 = Color3.fromRGB(0, 200, 120)
+                hudLabel.Font = Enum.Font.GothamBold
+                hudLabel.TextSize = 16
+                hudLabel.TextWrapped = true
+                hudLabel.Text = "BLACK SCREEN MODE"
+                hudLabel.Parent = f
+            end
+            overlay.Enabled = true
+            pcall(function() RunService:Set3dRenderingEnabled(false) end)
+        else
+            if overlay then overlay.Enabled = false end
+            pcall(function() RunService:Set3dRenderingEnabled(true) end)
+        end
+    end
+
+    -- public API ---------------------------------------------------------------------------
+    function perf.setBlack(on) perf.black = on and true or false; black(perf.black) end
+    function perf.setLowGfx(on) perf.lowgfx = on and true or false; lowGfx(perf.lowgfx) end
+    function perf.setNoFx(on) perf.nofx = on and true or false; noFx(perf.nofx) end
+    function perf.setMute(on) perf.mute = on and true or false; return mute(perf.mute) end
+    function perf.setFps(on) perf.fps = on and true or false; return fpsCap(perf.fps, Config.FpsCap) end
+    function perf.restoreAll()
+        pcall(black, false)
+        pcall(lowGfx, false)
+        pcall(noFx, false)
+        pcall(mute, false)
+        if perf.fps then pcall(fpsCap, false, 0) end
+        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps = false, false, false, false, false
+        pcall(function() if overlay then overlay:Destroy() end end)
+        overlay = nil
+    end
+    function perf.summary()
+        local on = {}
+        if perf.black then on[#on + 1] = "black" end
+        if perf.lowgfx then on[#on + 1] = "low-gfx" end
+        if perf.nofx then on[#on + 1] = "no-fx" end
+        if perf.mute then on[#on + 1] = "mute" end
+        if perf.fps then on[#on + 1] = "fps " .. Config.FpsCap end
+        return #on > 0 and table.concat(on, ", ") or "all off"
+    end
+    function perf.tick(now)
+        -- the game may switch effects back on (weather, UI blur ...): re-apply now and then
+        if perf.lowgfx and now - lastReapply >= 5 then
+            lastReapply = now
+            pcall(lowGfx, true)
+        end
+        if perf.black and hudLabel and now - lastHud >= 1 then
+            lastHud = now
+            local txt = "BLACK SCREEN MODE   (RightShift = exit)"
+            local st = readStats()
+            if st and st.cash then
+                local elapsed, net, fishGain = sessionNumbers(st, now)
+                txt = txt .. "\n\n$" .. commas(st.cash) .. "    net " .. signedMoney(net) .. "    " ..
+                    signedMoney(perHour(net, elapsed)) .. "/h\nfish +" .. commas(fishGain) .. "    " .. fmtTime(elapsed)
+            end
+            hudLabel.Text = txt .. "\n" .. tostring(statusText)
+        end
+    end
+end
+
 -- the game's own AFK mode: Events.AFK sends a countdown text every second ("Rejoin in 900s ...")
 task.spawn(function()
     local ev = RS:WaitForChild("Events", 20)
@@ -937,6 +1148,7 @@ local function utilityStep()
     pcall(espStep, now)
     pcall(updateSkillUi, now)
     pcall(updateBossUi, now)
+    pcall(perf.tick, now)
 
     -- the game has its own AFK mode (ClientModule.AFK): 60s without key/click input -> client fires Events.AFK
     -- and Data[UserId].AFK becomes true. VirtualUser does not produce UserInputService events, so Anti-AFK alone
@@ -997,6 +1209,7 @@ local function utilityStep()
         ui.esp.taoist(espFound.Taoist > 0 and ("found x" .. espFound.Taoist) or "not spawned right now")
         ui.esp.maoshan(espFound.Maoshan > 0 and ("found x" .. espFound.Maoshan) or "not spawned right now")
     end
+    if ui.perf then ui.perf(perf.summary()) end
     if ui.afk then
         local txt = Config.AntiAFK and ("ON - last ping " .. fmtAgo(now - afk.last) .. " (" .. afk.pings .. ")") or "OFF"
         if now - gameAfkTime < 3 then
@@ -1294,7 +1507,7 @@ local function attachGui(gui)
 end
 
 local sg = new("ScreenGui", {
-    Name = "PPINGYYY_AutoFish", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = true,
+    Name = "PPINGYYY_AutoFish", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = true, DisplayOrder = 10,
 })
 attachGui(sg)
 espTracerHolder = new("Frame", { Name = "Tracers", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Active = false }, sg)
@@ -1493,7 +1706,10 @@ local function toggleButton(label, h, initial, onChange)
         refresh(true)
         onChange(state)
     end)
-    return row
+    return row, function(v)
+        state = v and true or false
+        refresh(true)
+    end
 end
 
 local function actionButton(text, h, onClick)
@@ -1913,6 +2129,40 @@ end
 
 selectTab("Fish")
 
+-- 🚀 Performance --------------------------------------------------------
+section("🚀 PERFORMANCE SAVER")
+do
+    local _, setBlackVisual = toggleButton("Black screen (turns 3D rendering off)  [RightShift]", 34, false, function(v)
+        play(clickSound)
+        perf.setBlack(v)
+    end)
+    ui.setBlack = setBlackVisual
+end
+toggleButton("Low graphics (shadows, effects, water)", 30, false, function(v)
+    play(clickSound)
+    perf.setLowGfx(v)
+end)
+toggleButton("Disable particles / beams / lights", 30, false, function(v)
+    play(clickSound)
+    perf.setNoFx(v)
+end)
+toggleButton("Mute game audio", 30, false, function(v)
+    play(clickSound)
+    perf.setMute(v)
+end)
+toggleButton("Limit FPS" .. (setfpscap and "" or "  (not supported by this executor)"), 30, false, function(v)
+    play(clickSound)
+    perf.setFps(v)
+end)
+makeSlider("FPS cap", "fps", 5, 60, 5, 5, 0, Config.FpsCap, function(v)
+    Config.FpsCap = v
+    if perf.fps then perf.setFps(true) end
+end)
+do
+    local e = infoCard({ { "state", "Active" } }, 0.2)
+    ui.perf = e.state
+end
+
 -- status (always visible at the bottom) ------------------------------
 local StatusBox = new("Frame", {
     Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -76), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
@@ -1989,6 +2239,7 @@ local function unload()
     Config.WebhookEnabled = false
     Config.ESP_Taoist, Config.ESP_Maoshan = false, false
     pcall(function() espFolder:Destroy() end)
+    pcall(perf.restoreAll)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     if cleanupIntro then pcall(cleanupIntro) end
     pcall(function() sg:Destroy() end)
@@ -2005,6 +2256,9 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, processe
     if processed then return end
     if input.KeyCode == Enum.KeyCode.RightControl then
         sg.Enabled = not sg.Enabled
+    elseif input.KeyCode == Enum.KeyCode.RightShift then
+        perf.setBlack(not perf.black)
+        if ui.setBlack then ui.setBlack(perf.black) end
     end
 end)
 
@@ -2274,6 +2528,7 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
         end
     end
     pcall(utilityStep)
+    if perf.black then pcall(anchorRenderStep) end
     local now = tick()
     if now - lastUiTime >= 0.2 then
         lastUiTime = now
@@ -2297,4 +2552,4 @@ pcall(function()
         Duration = 4,
     })
 end)
-print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v5 loaded (Auto Cast + Anchor Bar + Skill + Boss logic + Economy + Anti-AFK + Stats + Webhook + ESP)")
+print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v6 loaded (Auto Cast + Anchor Bar + Skill + Boss logic + Economy + Anti-AFK + Stats + Webhook + ESP + Performance)")
