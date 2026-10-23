@@ -412,6 +412,12 @@ local WEBHOOK_PREFIXES = {
 }
 
 local ui = {}            -- UI setters, filled when the UI is built
+-- where the Anchor Bar sits right now: centre, plus a slow left/right swing (kept inside the game's 0.1-0.9 safe zone)
+function ui.barX()
+    local amp = math.clamp(Config.BarSway or 0, 0, 35) / 100
+    if amp <= 0 then return 0.5 end
+    return 0.5 + amp * math.sin(tick() * (Config.BarSwaySpeed or 0.4) * 2 * math.pi)
+end
 local uiReady = false
 local settingsDirtyAt = nil
 local session = { startTime = tick(), startCash = nil, startFish = nil }
@@ -1516,8 +1522,9 @@ local function engineStep()
                 local bar = barFrame and barFrame:FindFirstChild("Bar")
                 if bar then
                     pcall(function()
-                        bar:TweenPosition(UDim2.new(0.5, 0, 0.5, 0), Enum.EasingDirection.InOut, Enum.EasingStyle.Linear, 0, true)
-                        bar.Position = UDim2.new(0.5, 0, 0.5, 0)
+                        local x = ui.barX()
+                        bar:TweenPosition(UDim2.new(x, 0, 0.5, 0), Enum.EasingDirection.InOut, Enum.EasingStyle.Linear, 0, true)
+                        bar.Position = UDim2.new(x, 0, 0.5, 0)
                     end)
                 end
                 if now - lastProgressTime >= PROGRESS_INTERVAL then
@@ -1631,12 +1638,7 @@ local function anchorRenderStep()
     if bar then
         -- the game counts progress while Bar.Position.X.Scale is inside (0.1, 0.9) and fails it at <= 0 / >= 1,
         -- so a swing of at most +-35% around the centre (0.15 .. 0.85) always stays inside the safe zone
-        local x = 0.5
-        local amp = math.clamp(Config.BarSway or 0, 0, 35) / 100
-        if amp > 0 then
-            x = 0.5 + amp * math.sin(tick() * (Config.BarSwaySpeed or 0.4) * 2 * math.pi)
-        end
-        bar.Position = UDim2.new(x, 0, 0.5, 0)
+        bar.Position = UDim2.new(ui.barX(), 0, 0.5, 0)
     end
 
     local bossBar = fUI:FindFirstChild("BossFightBar")
@@ -1744,7 +1746,7 @@ espNotify = function(kind)
     end)
 end
 
-local FULL_SIZE = UDim2.new(0, 390, 0, 560)
+local FULL_SIZE = UDim2.new(0, 390, 0, 590)
 local MIN_SIZE = UDim2.new(0, 390, 0, 46)
 
 local Main = new("Frame", {
@@ -1781,7 +1783,7 @@ corner(MinBtn, 6)
 
 -- content area: tab bar + one scrolling page per tab ---------------------------------------
 local Content = new("Frame", {
-    Size = UDim2.new(1, 0, 1, -130), Position = UDim2.new(0, 0, 0, 46), BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 1, -160), Position = UDim2.new(0, 0, 0, 46), BackgroundTransparency = 1,
 }, Main)
 local TabBar = new("Frame", { Size = UDim2.new(1, -20, 0, 32), Position = UDim2.new(0, 10, 0, 2), BackgroundTransparency = 1 }, Content)
 new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, TabBar)
@@ -2414,7 +2416,7 @@ end
 
 -- status (always visible at the bottom) ------------------------------
 local StatusBox = new("Frame", {
-    Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -76), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
+    Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -106), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
 }, Main)
 corner(StatusBox, 10)
 new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, StatusBox)
@@ -2430,9 +2432,18 @@ local DetailLabel = new("TextLabel", {
 }, StatusBox)
 
 -- dragging ----------------------------------------------------------
+-- a "move" handle along the bottom of the expanded window (the title bar drags too)
+local MoveBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 24), Position = UDim2.new(0, 10, 1, -32), Text = "✥  Hold & drag here to move window",
+    Font = Enum.Font.GothamBold, TextSize = 11, BackgroundColor3 = COL_CARD, TextColor3 = COL_TEXT2,
+    AutoButtonColor = false,
+}, Main)
+corner(MoveBtn, 8)
+new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, MoveBtn)
 do
     local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
-    TitleBar.InputBegan:Connect(function(input)
+    for _, handle in ipairs({ TitleBar, MoveBtn }) do
+    handle.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
@@ -2442,11 +2453,12 @@ do
             end)
         end
     end)
-    TitleBar.InputChanged:Connect(function(input)
+    handle.InputChanged:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
             dragInput = input
         end
     end)
+    end
     conns[#conns + 1] = UserInputService.InputChanged:Connect(function(input)
         if dragging and input == dragInput then
             local delta = input.Position - dragStart
@@ -2463,6 +2475,7 @@ MinBtn.MouseButton1Click:Connect(function()
     if minimized then
         Content.Visible = false
         StatusBox.Visible = false
+        MoveBtn.Visible = false
         TweenService:Create(Main, TweenInfo.new(0.2), { Size = MIN_SIZE }):Play()
         MinBtn.Text = "+"
     else
@@ -2471,6 +2484,7 @@ MinBtn.MouseButton1Click:Connect(function()
             if running and not minimized then
                 Content.Visible = true
                 StatusBox.Visible = true
+                MoveBtn.Visible = true
             end
         end)
         MinBtn.Text = "—"
