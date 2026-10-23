@@ -53,6 +53,8 @@ local Config = {
     CastDelay = 1.0,          -- seconds to wait after a catch / when idle before casting
     StopWhenFull = true,      -- stop casting when the inventory is full
     -- minigame
+    BarSway = 20,             -- Anchor Bar: how far the bar swings left/right around the centre, in % of the track (0 = fixed)
+    BarSwaySpeed = 0.4,       -- swings per second
     AnchorBar = true,         -- keep the bar centred + send fish progression + boss bar / hp bar helpers
     AutoSlam = true,          -- answer / press the Slam (Perfect) prompt
     AutoCharge = true,        -- answer / press the Charge prompt
@@ -73,10 +75,14 @@ local Config = {
     MaterialFarming = false,  -- protect the craft-material fish from being sold
     -- utilities
     AntiAFK = true,
+    IdleMotion = false,       -- every N minutes: a small camera sweep (+ a jump when nothing is being fished)
+    IdleMotionMin = 30,
     LeaveGameAFK = false,     -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
     WebhookEnabled = false,
     WebhookUrl = "",
-    WebhookInterval = 15,     -- minutes between webhook reports
+    WebhookInterval = 15,     -- minutes between webhook reports (normal mode)
+    WebhookLive = true,       -- live mode: ONE message that is edited in place
+    LiveInterval = 30,        -- seconds between live edits
     ESP_Taoist = false,
     ESP_Maoshan = false,
     ESP_Tracer = false,
@@ -411,6 +417,7 @@ local settingsDirtyAt = nil
 local session = { startTime = tick(), startCash = nil, startFish = nil }
 local afk = { pings = 0, last = tick() }
 local webhookBusy = false
+local live = { id = "", busy = false, last = 0, backoff = 0 }   -- live webhook message state
 local lastWebhookTime = tick()   -- when the last report was sent / when the timer was (re)started
 local webhookStatus = "Idle"
 local lastStatsTime = 0
@@ -421,6 +428,8 @@ local function saveSettings()
     pcall(function()
         writefile(SETTINGS_FILE, HttpService:JSONEncode({
             WebhookUrl = Config.WebhookUrl, WebhookInterval = Config.WebhookInterval, AntiAFK = Config.AntiAFK,
+            WebhookLive = Config.WebhookLive, LiveInterval = Config.LiveInterval,
+            LiveMsgId = live.id, LiveMsgUrl = Config.WebhookUrl,
         }))
     end)
 end
@@ -440,6 +449,10 @@ local function loadSettings()
                     Config.WebhookInterval = math.clamp(math.floor(data.WebhookInterval), WEBHOOK_MIN, WEBHOOK_MAX)
                 end
                 if type(data.AntiAFK) == "boolean" then Config.AntiAFK = data.AntiAFK end
+                if type(data.WebhookLive) == "boolean" then Config.WebhookLive = data.WebhookLive end
+                if type(data.LiveInterval) == "number" then Config.LiveInterval = math.clamp(math.floor(data.LiveInterval), 10, 300) end
+                -- keep editing the same Discord message after a re-execute (only if it is still the same webhook)
+                if type(data.LiveMsgId) == "string" and data.LiveMsgUrl == Config.WebhookUrl then live.id = data.LiveMsgId end
             end
         end
     end)
@@ -482,6 +495,37 @@ end
 -- Anti-AFK ----------------------------------------------------------------------------
 -- Roblox fires Player.Idled after ~20 minutes without input and then kicks the player.
 -- VirtualUser lets us fake a click so the idle timer is reset.
+-- "Idle motion": a visible bit of activity every N minutes (camera sweep, and a jump when it is safe).
+-- It only changes what a person looking at your character sees; it does not make the script safer to use.
+afk.lastMotion = tick()
+afk.motionBusy = false
+afk.motion = function()
+    if afk.motionBusy then return end
+    afk.motionBusy = true
+    task.spawn(function()
+        pcall(function()
+            local char = lp.Character
+            local cam = workspace.CurrentCamera
+            if cam then
+                local steps, total = 36, math.rad(24)
+                for i = 1, steps do
+                    if not running then break end
+                    local dir = (i <= steps / 2) and 1 or -1    -- sweep right, then back
+                    cam.CFrame = cam.CFrame * CFrame.Angles(0, dir * total / (steps / 2), 0)
+                    RunService.RenderStepped:Wait()
+                end
+            end
+            -- jump only when no line is in the water and no fight is running (moving could cancel the cast)
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum and running and char:GetAttribute("Fishing") ~= true and char:GetAttribute("Minigame") ~= true
+                and hum:GetState() ~= Enum.HumanoidStateType.Seated then
+                hum.Jump = true
+            end
+        end)
+        afk.motionBusy = false
+    end)
+end
+
 local function afkPing()
     local ok = pcall(function()
         local vu = game:GetService("VirtualUser")
@@ -513,13 +557,35 @@ local function readStats()
         if s == "" then s = "None" end
         return s
     end
-    return { cash = num("Cash"), fish = num("FishCaught"), rod = str("FishingRod"), bait = str("EquippedBait") }
+    -- Data[UserId].Level.{Level, Experience, MaxExperience}; the weather is the Workspace attribute "Weather"
+    local lvl, exp, maxExp = nil, nil, nil
+    local lf = pData:FindFirstChild("Level")
+    if lf then
+        local a, b, c = lf:FindFirstChild("Level"), lf:FindFirstChild("Experience"), lf:FindFirstChild("MaxExperience")
+        lvl = a and tonumber(a.Value)
+        exp = b and tonumber(b.Value)
+        maxExp = c and tonumber(c.Value)
+    end
+    local weather = workspace:GetAttribute("Weather")
+    return {
+        cash = num("Cash"), fish = num("FishCaught"), rod = str("FishingRod"), bait = str("EquippedBait"),
+        level = lvl, exp = exp, maxExp = maxExp, weather = (weather ~= nil) and tostring(weather) or "?",
+    }
 end
 
 local function resetSession()
     session.startTime = tick()
     session.startCash = nil
     session.startFish = nil
+end
+
+local function levelText(st)
+    if not st.level then return "?" end
+    local txt = "Lv " .. commas(st.level)
+    if st.exp and st.maxExp and st.maxExp > 0 then
+        txt = txt .. "  (" .. math.floor(st.exp / st.maxExp * 100) .. "%)"
+    end
+    return txt
 end
 
 local function sessionNumbers(st, now)
@@ -556,9 +622,18 @@ end
 local function buildPayload(st, reason)
     local now = tick()
     local elapsed, netCash, fishGain = sessionNumbers(st, now)
-    local desc = (reason == "test") and "Test report" or ("Scheduled report (every " .. Config.WebhookInterval .. " min)")
+    local desc
+    if reason == "live" then
+        desc = "🔴 **LIVE**  •  updated <t:" .. os.time() .. ":R>  •  every " .. Config.LiveInterval .. "s"
+    elseif reason == "test" then
+        desc = "Test report"
+    else
+        desc = "Scheduled report (every " .. Config.WebhookInterval .. " min)"
+    end
     local fields = {
         { name = "👤 Player", value = lp.DisplayName .. " (@" .. lp.Name .. ")", inline = true },
+        { name = "⭐ Level", value = levelText(st), inline = true },
+        { name = "🌦️ Weather", value = st.weather or "?", inline = true },
         { name = "💰 Cash", value = "$" .. commas(st.cash or 0), inline = true },
         { name = "📈 Net Cash (session)", value = signedMoney(netCash), inline = true },
         { name = "⏱️ Cash / hour", value = signedMoney(perHour(netCash, elapsed)), inline = true },
@@ -568,12 +643,25 @@ local function buildPayload(st, reason)
         { name = "🪱 Bait", value = st.bait, inline = true },
         { name = "🕒 Session Time", value = fmtTime(elapsed), inline = true },
     }
+    -- current fight (only while one is running)
+    local fight = readCombat(getData())
+    if fight then
+        local bossHp = "?"
+        if fight.fmax and fight.fdmg and fight.fmax > 0 then
+            bossHp = math.floor(math.max(0, fight.fmax - fight.fdmg) / fight.fmax * 100 + 0.5) .. "%"
+        end
+        local myHp = fight.hpFrac and (math.floor(fight.hpFrac * 100 + 0.5) .. "%") or "?"
+        fields[#fields + 1] = {
+            name = fight.boss and "👹 Boss Fight" or "🎣 Fighting",
+            value = tostring(fight.name or "?") .. "\nBoss HP " .. bossHp .. "  •  My HP " .. myHp, inline = false,
+        }
+    end
     return {
         username = "4896 Polar Bear",
         embeds = { {
-            title = "📊 Money Stats Report",
+            title = (reason == "live") and "📡 Live Money Stats" or "📊 Money Stats Report",
             description = desc,
-            color = 57855,
+            color = (reason == "live") and 65430 or 57855,
             fields = fields,
             footer = { text = "4896 Polar Bear • Auto Fish" },
             timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
@@ -620,6 +708,96 @@ local function sendWebhook(reason)
             webhookStatus = "Failed: " .. tostring(resp)
         end
         webhookBusy = false
+    end)
+end
+
+-- Live webhook: the first call POSTs a message (?wait=true returns it, so we learn its id), every later call
+-- PATCHes that same message, so the channel always shows ONE card that keeps updating.
+local function liveUpdate()
+    if live.busy then return end
+    local url = Config.WebhookUrl
+    if not validWebhook(url) then
+        webhookStatus = "Invalid webhook URL"
+        return
+    end
+    local req = getHttpRequest()
+    if not req then
+        webhookStatus = "Executor has no request() function"
+        return
+    end
+    local st = readStats()
+    if not st then
+        webhookStatus = "No player data found"
+        return
+    end
+    live.busy = true
+    live.last = tick()
+    local payload = buildPayload(st, "live")
+    task.spawn(function()
+        local function call(method, u, body)
+            local ok, resp = pcall(function()
+                return req({
+                    Url = u, Method = method, Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode(body),
+                })
+            end)
+            if ok and type(resp) == "table" then return resp end
+            return nil, tostring(resp)
+        end
+        local function codeOf(resp) return resp.StatusCode or resp.status_code end
+        local function bodyOf(resp)
+            local ok, data = pcall(function() return HttpService:JSONDecode(resp.Body or resp.body or "{}") end)
+            return ok and type(data) == "table" and data or {}
+        end
+
+        local base = (string.gsub(url, "%?.*$", ""))
+        local resp, err
+        if live.id ~= "" then
+            resp, err = call("PATCH", base .. "/messages/" .. live.id, { embeds = payload.embeds })
+            if resp then
+                local code = codeOf(resp)
+                if type(code) == "number" and code >= 200 and code < 300 then
+                    webhookStatus = "Live updated " .. os.date("%H:%M:%S")
+                elseif code == 404 then
+                    live.id = ""          -- the message was deleted: post a new one on the next tick
+                    live.last = 0
+                    webhookStatus = "Live message deleted - creating a new one"
+                elseif code == 429 then
+                    local wait = tonumber(bodyOf(resp).retry_after) or 5
+                    live.backoff = tick() + wait + 1
+                    webhookStatus = "Rate limited, retry in " .. math.ceil(wait) .. "s"
+                else
+                    webhookStatus = "Live edit failed: HTTP " .. tostring(code)
+                end
+            else
+                webhookStatus = "Live edit failed: " .. tostring(err)
+            end
+        else
+            local joiner = string.find(url, "?", 1, true) and "&" or "?"
+            resp, err = call("POST", url .. joiner .. "wait=true", payload)
+            if resp then
+                local code = codeOf(resp)
+                if type(code) == "number" and code >= 200 and code < 300 then
+                    local id = bodyOf(resp).id
+                    if id then
+                        live.id = tostring(id)
+                        markDirty()
+                        webhookStatus = "Live message created " .. os.date("%H:%M:%S")
+                    else
+                        webhookStatus = "Sent, but no message id came back (editing impossible)"
+                    end
+                elseif code == 429 then
+                    local wait = tonumber(bodyOf(resp).retry_after) or 5
+                    live.backoff = tick() + wait + 1
+                    webhookStatus = "Rate limited, retry in " .. math.ceil(wait) .. "s"
+                else
+                    webhookStatus = "Live post failed: HTTP " .. tostring(code)
+                end
+            else
+                webhookStatus = "Live post failed: " .. tostring(err)
+            end
+        end
+        live.busy = false
     end)
 end
 
@@ -1164,6 +1342,12 @@ local function utilityStep()
         end
     end
 
+    -- idle motion
+    if Config.IdleMotion and now - afk.lastMotion >= Config.IdleMotionMin * 60 then
+        afk.lastMotion = now
+        afk.motion()
+    end
+
     -- anti-afk keep-alive
     if Config.AntiAFK and (now - afk.last >= AFK_KEEPALIVE) then afkPing() end
 
@@ -1174,8 +1358,12 @@ local function utilityStep()
     end
 
     -- webhook timer
-    if Config.WebhookEnabled and not webhookBusy and (now - lastWebhookTime >= Config.WebhookInterval * 60) then
-        sendWebhook("timer")
+    if Config.WebhookEnabled then
+        if Config.WebhookLive then
+            if not live.busy and now >= live.backoff and now - live.last >= Config.LiveInterval then liveUpdate() end
+        elseif not webhookBusy and (now - lastWebhookTime >= Config.WebhookInterval * 60) then
+            sendWebhook("timer")
+        end
     end
 
     -- once per second: refresh the stats panel
@@ -1203,6 +1391,8 @@ local function utilityStep()
         S.time(fmtTime(elapsed))
         S.rod(st.rod)
         S.bait(st.bait)
+        S.level(levelText(st))
+        S.weather(st.weather or "?")
     end
 
     if ui.esp then
@@ -1219,8 +1409,13 @@ local function utilityStep()
     end
     if ui.hook then
         if Config.WebhookEnabled then
-            local left = Config.WebhookInterval * 60 - (now - lastWebhookTime)
-            ui.hook.next(fmtTime(math.max(0, left)))
+            if Config.WebhookLive then
+                local left = math.max(0, Config.LiveInterval - (now - live.last))
+                ui.hook.next(live.busy and "updating..." or (math.ceil(left) .. "s  (live)"))
+            else
+                local left = Config.WebhookInterval * 60 - (now - lastWebhookTime)
+                ui.hook.next(fmtTime(math.max(0, left)))
+            end
         else
             ui.hook.next("Off")
         end
@@ -1433,7 +1628,16 @@ local function anchorRenderStep()
 
     local barFrame = fUI:FindFirstChild("BarFrame")
     local bar = barFrame and barFrame:FindFirstChild("Bar")
-    if bar then bar.Position = UDim2.new(0.5, 0, 0.5, 0) end
+    if bar then
+        -- the game counts progress while Bar.Position.X.Scale is inside (0.1, 0.9) and fails it at <= 0 / >= 1,
+        -- so a swing of at most +-35% around the centre (0.15 .. 0.85) always stays inside the safe zone
+        local x = 0.5
+        local amp = math.clamp(Config.BarSway or 0, 0, 35) / 100
+        if amp > 0 then
+            x = 0.5 + amp * math.sin(tick() * (Config.BarSwaySpeed or 0.4) * 2 * math.pi)
+        end
+        bar.Position = UDim2.new(x, 0, 0.5, 0)
+    end
 
     local bossBar = fUI:FindFirstChild("BossFightBar")
     if bossBar and bossBar.Visible and bossBar:FindFirstChild("Bar") and bossBar:FindFirstChild("Hitbox") then
@@ -1903,6 +2107,12 @@ toggleButton("Anchor Bar (Minigame)", 32, Config.AnchorBar, function(v)
     play(clickSound)
     Config.AnchorBar = v
 end)
+makeSlider("Bar Sway (left/right)", "%", 0, 35, 1, 5, 0, Config.BarSway, function(v)
+    Config.BarSway = v
+end)
+makeSlider("Bar Sway Speed", "/s", 0.1, 1.5, 0.1, 0.1, 1, Config.BarSwaySpeed, function(v)
+    Config.BarSwaySpeed = v
+end)
 toggleButton("Auto Slam / Crits", 28, Config.AutoSlam, function(v)
     play(clickSound)
     Config.AutoSlam = v
@@ -2026,6 +2236,7 @@ do
 -- 📊 Money Stats --------------------------------------------------------
 section("📊 MONEY STATS")
 ui.stats = infoCard({
+    { "level", "Level" }, { "weather", "Weather" },
     { "cash", "Current Cash" }, { "net", "Net Cash (session)" }, { "cph", "Cash / hour" },
     { "fish", "Total Fish Caught" }, { "fsess", "Fish (session)" }, { "fph", "Fish / hour" },
     { "time", "Session Time" }, { "rod", "Equipped Rod" }, { "bait", "Equipped Bait" },
@@ -2060,6 +2271,7 @@ urlBox.FocusLost:Connect(function()
         webhookStatus = "URL cleared"
         markDirty()
     elseif not string.find(txt, "…", 1, true) then
+        if txt ~= Config.WebhookUrl then live.id = "" end   -- another webhook = another live message
         Config.WebhookUrl = txt
         webhookStatus = validWebhook(txt) and "URL saved" or "Not a Discord webhook URL"
         markDirty()
@@ -2071,18 +2283,42 @@ toggleButton("Webhook Reports", 32, Config.WebhookEnabled, function(v)
     play(clickSound)
     Config.WebhookEnabled = v
     lastWebhookTime = tick()
+    live.last = 0
     if v and not validWebhook(Config.WebhookUrl) then webhookStatus = "Set a valid webhook URL first" end
 end)
-makeSlider("Report Every", "min", WEBHOOK_MIN, WEBHOOK_MAX, 1, 5, 0, Config.WebhookInterval, function(v)
+toggleButton("Live mode (edits ONE message, no spam)", 30, Config.WebhookLive, function(v)
+    play(clickSound)
+    Config.WebhookLive = v
+    live.last = 0
+    markDirty()
+end)
+makeSlider("Live update every", "s", 10, 120, 5, 5, 0, Config.LiveInterval, function(v)
+    Config.LiveInterval = v
+    markDirty()
+end)
+makeSlider("Report Every (normal mode)", "min", WEBHOOK_MIN, WEBHOOK_MAX, 1, 5, 0, Config.WebhookInterval, function(v)
     Config.WebhookInterval = v
     lastWebhookTime = tick()  -- changing the interval restarts the countdown
     markDirty()
 end)
 actionButton("📨 Send Test Report Now", 28, function()
     play(sellSound)
-    sendWebhook("test")
+    if Config.WebhookLive then
+        live.last = 0
+        live.backoff = 0
+        liveUpdate()
+    else
+        sendWebhook("test")
+    end
 end)
-ui.hook = infoCard({ { "next", "Next report in" }, { "status", "Last result" } })
+actionButton("🆕 Start a fresh live message", 26, function()
+    play(clickSound)
+    live.id = ""
+    live.last = 0
+    markDirty()
+    webhookStatus = "Next update creates a new message"
+end)
+ui.hook = infoCard({ { "next", "Next update" }, { "status", "Last result" } }, 0.28)
 uiReady = true
 
 end
@@ -2099,6 +2335,19 @@ end)
 toggleButton("Leave game AFK mode automatically (else it rejoins you after 15 min)", 34, Config.LeaveGameAFK, function(v)
     play(clickSound)
     Config.LeaveGameAFK = v
+end)
+toggleButton("Idle motion (camera sweep + jump)", 30, Config.IdleMotion, function(v)
+    play(clickSound)
+    Config.IdleMotion = v
+    afk.lastMotion = tick()
+end)
+makeSlider("Idle motion every", "min", 5, 60, 5, 5, 0, Config.IdleMotionMin, function(v)
+    Config.IdleMotionMin = v
+    afk.lastMotion = tick()
+end)
+actionButton("▶ Do it once now", 26, function()
+    play(clickSound)
+    afk.motion()
 end)
 ui.afk = infoCard({ { "afk", "Status" } }, 0.17).afk
 
@@ -2552,4 +2801,4 @@ pcall(function()
         Duration = 4,
     })
 end)
-print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v6 loaded (Auto Cast + Anchor Bar + Skill + Boss logic + Economy + Anti-AFK + Stats + Webhook + ESP + Performance)")
+print("★ [PPINGYYY] 4896 Polar Bear - Auto Fish v7 loaded (Auto Cast + Anchor Bar + Skill + Boss logic + Economy + Anti-AFK + Stats + Webhook + ESP + Performance)")
