@@ -54,7 +54,7 @@ local Config = {
     StopWhenFull = true,      -- stop casting when the inventory is full
     -- minigame
     BarSway = 20,             -- Anchor Bar: how far the bar swings left/right around the centre, in % of the track (0 = fixed)
-    BarSwaySpeed = 0.4,       -- swings per second
+    BarSwaySpeed = 4,         -- jumps per second
     AnchorBar = true,         -- keep the bar centred + send fish progression + boss bar / hp bar helpers
     AutoSlam = true,          -- answer / press the Slam (Perfect) prompt
     AutoCharge = true,        -- answer / press the Charge prompt
@@ -413,10 +413,19 @@ local WEBHOOK_PREFIXES = {
 
 local ui = {}            -- UI setters, filled when the UI is built
 -- where the Anchor Bar sits right now: centre, plus a slow left/right swing (kept inside the game's 0.1-0.9 safe zone)
+-- the bar JUMPS instantly to the other side every so often (like quick clicks), it does not glide
+local barJump = { x = 0.5, nextAt = 0, side = 1 }
 function ui.barX()
     local amp = math.clamp(Config.BarSway or 0, 0, 35) / 100
     if amp <= 0 then return 0.5 end
-    return 0.5 + amp * math.sin(tick() * (Config.BarSwaySpeed or 0.4) * 2 * math.pi)
+    local now = tick()
+    if now >= barJump.nextAt then
+        local rate = math.clamp(Config.BarSwaySpeed or 4, 0.5, 15)
+        barJump.side = -barJump.side
+        barJump.x = 0.5 + barJump.side * amp * (0.4 + 0.6 * math.random())
+        barJump.nextAt = now + (1 / rate) * (0.7 + 0.6 * math.random())
+    end
+    return math.clamp(barJump.x, 0.15, 0.85)
 end
 local uiReady = false
 local settingsDirtyAt = nil
@@ -2109,10 +2118,10 @@ toggleButton("Anchor Bar (Minigame)", 32, Config.AnchorBar, function(v)
     play(clickSound)
     Config.AnchorBar = v
 end)
-makeSlider("Bar Sway (left/right)", "%", 0, 35, 1, 5, 0, Config.BarSway, function(v)
+makeSlider("Bar Jump Range (left/right)", "%", 0, 35, 1, 5, 0, Config.BarSway, function(v)
     Config.BarSway = v
 end)
-makeSlider("Bar Sway Speed", "/s", 0.1, 1.5, 0.1, 0.1, 1, Config.BarSwaySpeed, function(v)
+makeSlider("Bar Jump Speed", "/s", 1, 12, 1, 1, 0, Config.BarSwaySpeed, function(v)
     Config.BarSwaySpeed = v
 end)
 toggleButton("Auto Slam / Crits", 28, Config.AutoSlam, function(v)
