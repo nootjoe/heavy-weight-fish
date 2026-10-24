@@ -413,19 +413,35 @@ local WEBHOOK_PREFIXES = {
 
 local ui = {}            -- UI setters, filled when the UI is built
 -- where the Anchor Bar sits right now: centre, plus a slow left/right swing (kept inside the game's 0.1-0.9 safe zone)
--- the bar JUMPS instantly to the other side every so often (like quick clicks), it does not glide
-local barJump = { x = 0.5, nextAt = 0, side = 1 }
+-- Mimics what the bar does when a real player clicks (measured from a remote log): the bar slides left on its own
+-- (~0.8 per second), and each click pushes it right by ~0.1 over 2-3 frames, so it saw-tooths around the centre.
+local barJump = { x = 0.5, last = 0, kick = 0, trigger = 0.45, lazy = false }
 function ui.barX()
     local amp = math.clamp(Config.BarSway or 0, 0, 35) / 100
     if amp <= 0 then return 0.5 end
     local now = tick()
-    if now >= barJump.nextAt then
-        local rate = math.clamp(Config.BarSwaySpeed or 4, 0.5, 15)
-        barJump.side = -barJump.side
-        barJump.x = 0.5 + barJump.side * amp * (0.4 + 0.6 * math.random())
-        barJump.nextAt = now + (1 / rate) * (0.7 + 0.6 * math.random())
+    local dt = math.clamp(now - barJump.last, 0, 0.1)
+    if barJump.last == 0 then dt = 0 end
+    barJump.last = now
+    local b = barJump
+    local drift = math.clamp(Config.BarSwaySpeed or 4, 0.5, 15) * 0.2          -- bar units per second (default 0.8)
+    if b.kick > 0 then
+        local step = math.min(b.kick, 2.1 * dt)                                 -- ~0.035 per frame at 60 fps
+        b.x = b.x + step
+        b.kick = b.kick - step
+    else
+        b.x = b.x - drift * dt
+        if b.x <= b.trigger then                                                -- "click": push right by about 0.1
+            b.kick = 0.08 + 0.04 * math.random()
+            local low = 0.5 - amp * 0.25
+            b.lazy = math.random() < 0.12                                       -- now and then wait longer, like a human
+            b.trigger = low - 0.02 + 0.04 * math.random() - (b.lazy and amp * 0.8 * math.random() or 0)
+        end
     end
-    return math.clamp(barJump.x, 0.15, 0.85)
+    b.x = math.clamp(b.x, 0.15, 0.85)
+    -- pull slowly back to the centre if it wandered off
+    if b.x > 0.5 + amp * 0.9 then b.x = b.x - 0.01 end
+    return b.x
 end
 local uiReady = false
 local settingsDirtyAt = nil
