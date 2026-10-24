@@ -65,6 +65,9 @@ local Config = {
     HealBelow = 50,           -- percent of max HP
     HoldOnInvincible = true,  -- do not spend attack skills while the boss is invincible (~3 s after it restores its HP)
     FpsCap = 30,              -- used by "Limit FPS"
+    BlackFps = 20,            -- FPS cap used automatically while the black screen is on
+    BlackHideUi = true,       -- black screen also switches the game's own UI + Roblox core UI off (less to draw)
+    BlackHud = false,         -- show the small money/status text on the black screen (false = completely black)
     BossAlert = true,         -- notify when the server announces secret bosses
     SkillMode = "Remote",     -- "Remote" = UseSkill remotes during the minigame, "Keys" = press Z/X/C/V
     -- economy
@@ -1075,7 +1078,7 @@ do
     local g = {}                                        -- single saved values (quality level, volume, fps cap)
     local fxConn, fxToken = nil, 0
     local overlay, hudLabel = nil, nil
-    local lastReapply, lastHud = 0, 0
+    local lastReapply, lastHud, lastUi = 0, 0, 0
 
     local function setProp(inst, prop, value)
         pcall(function()
@@ -1182,6 +1185,38 @@ do
         return pcall(function() setfpscap(on and n or g.fps) end)
     end
 
+    local function refreshFps()
+        if not setfpscap then return false end
+        local want = nil
+        if perf.black then want = Config.BlackFps end
+        if perf.fps then want = want and math.min(want, Config.FpsCap) or Config.FpsCap end
+        return fpsCap(want ~= nil, want)
+    end
+
+    -- the game's own UI + Roblox core UI: not drawing them saves CPU/GPU (scripts keep running, Visible values are untouched)
+    local function hideUi(on)
+        if on then
+            local pg = lp:FindFirstChild("PlayerGui")
+            if pg and Config.BlackHideUi then
+                for _, gui in ipairs(pg:GetChildren()) do
+                    if gui:IsA("ScreenGui") and gui ~= overlay and gui.Name ~= "PPINGYYY_AutoFish" then
+                        setProp(gui, "Enabled", false)
+                    end
+                end
+                if not g.core then
+                    g.core = true
+                    pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, false) end)
+                end
+            end
+        else
+            restoreProps(function(i) return i:IsA("ScreenGui") end)
+            if g.core then
+                g.core = nil
+                pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, true) end)
+            end
+        end
+    end
+
     -- black screen ---------------------------------------------------------------------------
     local function attach(gui)
         for _, getter in ipairs({ function() return gethui and gethui() end, function() return game:GetService("CoreGui") end }) do
@@ -1200,13 +1235,14 @@ do
                 overlay.Name = "PPINGYYY_BlackScreen"
                 overlay.ResetOnSpawn = false
                 overlay.IgnoreGuiInset = true
-                overlay.DisplayOrder = 5      -- above the game UI, below this script's window (DisplayOrder 10)
+                overlay.DisplayOrder = 2147483647   -- on top of everything, so the screen is completely black
                 overlay.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
                 attach(overlay)
                 local f = Instance.new("Frame")
                 f.Size = UDim2.new(1, 0, 1, 0)
                 f.BackgroundColor3 = Color3.new(0, 0, 0)
                 f.BorderSizePixel = 0
+                f.BackgroundTransparency = 0
                 f.Active = true               -- swallows clicks so nothing in the game is hit by accident
                 f.Parent = overlay
                 hudLabel = Instance.new("TextLabel")
@@ -1218,30 +1254,34 @@ do
                 hudLabel.Font = Enum.Font.GothamBold
                 hudLabel.TextSize = 16
                 hudLabel.TextWrapped = true
-                hudLabel.Text = "BLACK SCREEN MODE"
+                hudLabel.Text = ""
+                hudLabel.Visible = false
                 hudLabel.Parent = f
             end
             overlay.Enabled = true
             pcall(function() RunService:Set3dRenderingEnabled(false) end)
+            hideUi(true)
         else
             if overlay then overlay.Enabled = false end
             pcall(function() RunService:Set3dRenderingEnabled(true) end)
+            hideUi(false)
         end
     end
 
     -- public API ---------------------------------------------------------------------------
-    function perf.setBlack(on) perf.black = on and true or false; black(perf.black) end
+    function perf.setBlack(on) perf.black = on and true or false; black(perf.black); refreshFps() end
     function perf.setLowGfx(on) perf.lowgfx = on and true or false; lowGfx(perf.lowgfx) end
     function perf.setNoFx(on) perf.nofx = on and true or false; noFx(perf.nofx) end
     function perf.setMute(on) perf.mute = on and true or false; return mute(perf.mute) end
-    function perf.setFps(on) perf.fps = on and true or false; return fpsCap(perf.fps, Config.FpsCap) end
+    function perf.setFps(on) perf.fps = on and true or false; return refreshFps() end
+    function perf.refreshFps() return refreshFps() end
     function perf.restoreAll()
+        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps = false, false, false, false, false
         pcall(black, false)
         pcall(lowGfx, false)
         pcall(noFx, false)
         pcall(mute, false)
-        if perf.fps then pcall(fpsCap, false, 0) end
-        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps = false, false, false, false, false
+        if g.fps ~= nil then pcall(fpsCap, false, 0) end
         pcall(function() if overlay then overlay:Destroy() end end)
         overlay = nil
     end
@@ -1260,7 +1300,14 @@ do
             lastReapply = now
             pcall(lowGfx, true)
         end
-        if perf.black and hudLabel and now - lastHud >= 1 then
+        if perf.black and Config.BlackHideUi and now - lastUi >= 5 then
+            lastUi = now
+            pcall(hideUi, true)      -- the game may re-enable its UI (new ScreenGuis, respawn ...)
+        end
+        if hudLabel and hudLabel.Visible ~= (perf.black and Config.BlackHud) then
+            hudLabel.Visible = perf.black and Config.BlackHud
+        end
+        if perf.black and Config.BlackHud and hudLabel and now - lastHud >= 1 then
             lastHud = now
             local txt = "BLACK SCREEN MODE   (RightShift = exit)"
             local st = readStats()
@@ -2414,21 +2461,45 @@ do
     end)
     ui.setBlack = setBlackVisual
 end
-toggleButton("Low graphics (shadows, effects, water)", 30, false, function(v)
+toggleButton("Black screen: also hide game UI + Roblox UI (saves more)", 30, Config.BlackHideUi, function(v)
     play(clickSound)
-    perf.setLowGfx(v)
+    Config.BlackHideUi = v
 end)
-toggleButton("Disable particles / beams / lights", 30, false, function(v)
+toggleButton("Black screen: show money/status text (off = completely black)", 30, Config.BlackHud, function(v)
     play(clickSound)
-    perf.setNoFx(v)
+    Config.BlackHud = v
 end)
-toggleButton("Mute game audio", 30, false, function(v)
-    play(clickSound)
-    perf.setMute(v)
+makeSlider("Black screen FPS", "fps", 5, 60, 5, 5, 0, Config.BlackFps, function(v)
+    Config.BlackFps = v
+    perf.refreshFps()
 end)
-toggleButton("Limit FPS" .. (setfpscap and "" or "  (not supported by this executor)"), 30, false, function(v)
+perf.vis = {}
+do
+    local _, v1 = toggleButton("Low graphics (shadows, effects, water)", 30, false, function(v)
+        play(clickSound)
+        perf.setLowGfx(v)
+    end)
+    local _, v2 = toggleButton("Disable particles / beams / lights", 30, false, function(v)
+        play(clickSound)
+        perf.setNoFx(v)
+    end)
+    local _, v3 = toggleButton("Mute game audio", 30, false, function(v)
+        play(clickSound)
+        perf.setMute(v)
+    end)
+    local _, v4 = toggleButton("Limit FPS" .. (setfpscap and "" or "  (not supported by this executor)"), 30, false, function(v)
+        play(clickSound)
+        perf.setFps(v)
+    end)
+    perf.vis = { lowgfx = v1, nofx = v2, mute = v3, fps = v4 }
+end
+actionButton("⚡ MAX SAVER: everything on (black + low gfx + no fx + mute + fps)", 34, function()
     play(clickSound)
-    perf.setFps(v)
+    perf.setBlack(true); if ui.setBlack then ui.setBlack(true) end
+    perf.setLowGfx(true); perf.setNoFx(true); perf.setMute(true); perf.setFps(true)
+    for _, k in ipairs({ "lowgfx", "nofx", "mute", "fps" }) do
+        if perf.vis[k] then pcall(perf.vis[k], true) end
+    end
 end)
 makeSlider("FPS cap", "fps", 5, 60, 5, 5, 0, Config.FpsCap, function(v)
     Config.FpsCap = v
