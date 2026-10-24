@@ -16,6 +16,7 @@
                              Events.FavoriteItem       -> FireServer(item)
                              Data[UserId].Hotbar / Inventory (items have .Favorite) / InventoryLimit
     Anti-AFK   : Player.Idled + VirtualUser (click) so Roblox does not kick you after 20 min idle
+    Human break: random pauses of Auto Cast, a few steps around the fishing spot, back + face the sea, cast again
     Money stats: Data[UserId].Cash / FishCaught / FishingRod / EquippedBait
     Webhook    : executor request() -> Discord webhook (embed), interval slider 1-120 min
     Skills     : cooldown-aware Auto Skill (Character.Skills[...].Value = cooldown, UsingSkill = casting)
@@ -78,9 +79,12 @@ local Config = {
     MaterialFarming = false,  -- protect the craft-material fish from being sold
     -- utilities
     AntiAFK = true,
-    IdleMotion = false,       -- every N minutes: a small camera sweep (+ a jump when nothing is being fished)
-    IdleMotionMin = 30,
-    LeaveGameAFK = true,     -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
+    IdleMotion = false,       -- "human break": stop casting now and then, walk a few steps, come back, face the sea
+    BreakMin = 5,             -- minutes between breaks: earliest ...
+    BreakMax = 15,            -- ... and latest (the real delay is random and sometimes falls outside this range)
+    BreakWalk = 8,            -- studs: how far from the fishing spot a break may wander
+    FaceSea = true,           -- before every cast: stand on the saved spot and look in the saved (sea) direction
+    LeaveGameAFK = false,     -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
     WebhookEnabled = false,
     WebhookUrl = "",
     WebhookInterval = 15,     -- minutes between webhook reports (normal mode)
@@ -529,37 +533,7 @@ end
 -- Anti-AFK ----------------------------------------------------------------------------
 -- Roblox fires Player.Idled after ~20 minutes without input and then kicks the player.
 -- VirtualUser lets us fake a click so the idle timer is reset.
--- "Idle motion": a visible bit of activity every N minutes (camera sweep, and a jump when it is safe).
--- It only changes what a person looking at your character sees; it does not make the script safer to use.
-afk.lastMotion = tick()
-afk.motionBusy = false
-afk.motion = function()
-    if afk.motionBusy then return end
-    afk.motionBusy = true
-    task.spawn(function()
-        pcall(function()
-            local char = lp.Character
-            local cam = workspace.CurrentCamera
-            if cam then
-                local steps, total = 36, math.rad(24)
-                for i = 1, steps do
-                    if not running then break end
-                    local dir = (i <= steps / 2) and 1 or -1    -- sweep right, then back
-                    cam.CFrame = cam.CFrame * CFrame.Angles(0, dir * total / (steps / 2), 0)
-                    RunService.RenderStepped:Wait()
-                end
-            end
-            -- jump only when no line is in the water and no fight is running (moving could cancel the cast)
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if hum and running and char:GetAttribute("Fishing") ~= true and char:GetAttribute("Minigame") ~= true
-                and hum:GetState() ~= Enum.HumanoidStateType.Seated then
-                hum.Jump = true
-            end
-        end)
-        afk.motionBusy = false
-    end)
-end
-
+-- (the old camera-sweep "idle motion" was replaced by the walking "human break", see hm below)
 local function afkPing()
     local ok = pcall(function()
         local vu = game:GetService("VirtualUser")
@@ -1420,12 +1394,6 @@ local function utilityStep()
         end
     end
 
-    -- idle motion
-    if Config.IdleMotion and now - afk.lastMotion >= Config.IdleMotionMin * 60 then
-        afk.lastMotion = now
-        afk.motion()
-    end
-
     -- anti-afk keep-alive
     if Config.AntiAFK and (now - afk.last >= AFK_KEEPALIVE) then afkPing() end
 
@@ -1502,6 +1470,281 @@ local function utilityStep()
 end
 
 ---------------------------------------------------------------------
+-- Human break + sea facing
+---------------------------------------------------------------------
+local hm = {
+    spot = nil,          -- { pos = Vector3, look = unit flat Vector3 }: where every cast is thrown from
+    pendingCast = nil,   -- { t = tick(), cf = CFrame }: cast sent, waiting for Fishing = true
+    fails = 0,           -- casts in a row that did not start fishing
+    needFace = false,    -- a cast failed: re-face the spot before the next one
+    busy = false,        -- a walk / realign routine is running -> the engine must not cast
+    text = "",
+    nextAt = 0,          -- when the next break is due
+    token = 0,           -- changes whenever a routine starts, so an old routine stops itself
+}
+
+do
+    local CAST_VERIFY = 3.0     -- Fishing must turn true this many seconds after a cast (log: ~0.5 s)
+    local ALIGN_DIST = 3.0      -- farther than this from the spot (studs) -> walk back before casting
+    local ALIGN_ANGLE = 6       -- degrees of yaw tolerance
+    local TELEPORT_BACK = 30    -- farther than this (e.g. after "Sell Now & Teleport") -> snap back, do not walk
+
+    local function flat(v)
+        local f = Vector3.new(v.X, 0, v.Z)
+        if f.Magnitude < 1e-3 then return nil end
+        return f.Unit
+    end
+
+    local function flatDist(a, b)
+        return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+    end
+
+    local function rotated(v, deg)
+        return CFrame.Angles(0, math.rad(deg), 0):VectorToWorldSpace(v)
+    end
+
+    function hm.makeSpot(cf)
+        local look = flat(cf.LookVector)
+        if not look then return nil end
+        return { pos = cf.Position, look = look }
+    end
+
+    function hm.resetSpot()
+        hm.spot = nil
+        hm.pendingCast = nil
+        hm.fails = 0
+        hm.needFace = false
+    end
+
+    function hm.setSpotHere()
+        local char = lp.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root then
+            hm.spot = hm.makeSpot(root.CFrame)
+            hm.fails = 0
+            hm.needFace = false
+        end
+        return hm.spot ~= nil
+    end
+
+    -- irregular schedule: mostly somewhere between Min and Max, now and then clearly sooner or later
+    function hm.schedule(now)
+        local lo = math.max(1, Config.BreakMin)
+        local hi = math.max(lo, Config.BreakMax)
+        local roll = math.random()
+        local mins
+        if roll < 0.15 then
+            mins = lo * (0.5 + 0.5 * math.random())
+        elseif roll > 0.88 then
+            mins = hi * (1 + 0.5 * math.random())
+        else
+            mins = lo + (hi - lo) * math.random()
+        end
+        hm.nextAt = now + mins * 60
+    end
+
+    -- true + char/hum/root while it is still fine to keep walking
+    local function stillOk(token)
+        if not running or hm.token ~= token then return false end
+        local char = lp.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not (hum and root) or hum.Health <= 0 then return false end
+        if char:GetAttribute("Fishing") == true or char:GetAttribute("Minigame") == true then return false end
+        if char:GetAttribute("Swimming") == true then return false end
+        return true, char, hum, root
+    end
+
+    local function newParams(char)
+        local p = RaycastParams.new()
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        p.FilterDescendantsInstances = { char }
+        p.IgnoreWater = false
+        return p
+    end
+
+    local function groundAt(params, p)
+        return workspace:Raycast(Vector3.new(p.X, p.Y + 2, p.Z), Vector3.new(0, -14, 0), params)
+    end
+
+    -- a target is fine when: nothing solid in the way, dry ground under it, about the same height as the spot
+    local function targetOk(char, from, to, spot)
+        local params = newParams(char)
+        local wall = workspace:Raycast(from + Vector3.new(0, 1.5, 0), Vector3.new(to.X - from.X, 0, to.Z - from.Z), params)
+        if wall and wall.Material ~= Enum.Material.Water then return false end
+        local g1 = groundAt(params, to)
+        if not g1 or g1.Material == Enum.Material.Water then return false end
+        local g0 = groundAt(params, spot.pos)
+        if g0 and math.abs(g1.Position.Y - g0.Position.Y) > 2 then return false end
+        return true
+    end
+
+    -- random spot around the fishing spot, never in the casting direction (0 deg = toward the sea)
+    local function pickTarget(char, from, spot)
+        local maxWalk = math.max(4, Config.BreakWalk)
+        for _ = 1, 8 do
+            local ang = 100 + math.random() * 160
+            local dist = 3 + math.random() * (maxWalk - 3)
+            local to = spot.pos + rotated(spot.look, ang) * dist
+            if targetOk(char, from, to, spot) then return to end
+        end
+        return nil
+    end
+
+    local function walkTo(token, target, timeout)
+        local ok, char, hum, root = stillOk(token)
+        if not ok then return false end
+        local done = false
+        local conn = hum.MoveToFinished:Connect(function() done = true end)
+        hum:MoveTo(target)
+        local t0 = tick()
+        local lastPos, lastMove = root.Position, tick()
+        local alive = true
+        while not done do
+            task.wait(0.1)
+            ok, char, hum, root = stillOk(token)
+            if not ok then
+                alive = false
+                break
+            end
+            if tick() - t0 > timeout then break end
+            if flatDist(root.Position, target) < 1.2 then break end
+            if (root.Position - lastPos).Magnitude > 0.4 then
+                lastPos = root.Position
+                lastMove = tick()
+            elseif tick() - lastMove > 1.5 then
+                break          -- stuck against something: give up this leg
+            end
+        end
+        conn:Disconnect()
+        pcall(function()
+            local c = lp.Character
+            local h = c and c:FindFirstChildOfClass("Humanoid")
+            local r = c and c:FindFirstChild("HumanoidRootPart")
+            if h and r then h:MoveTo(r.Position) end   -- stop where we are
+        end)
+        return alive
+    end
+
+    -- smooth turn to look in `look` (flat unit vector)
+    local function faceSpot(token, look)
+        local ok, char, hum, root = stillOk(token)
+        if not ok then return end
+        local startRot = root.CFrame.Rotation
+        local goalRot = CFrame.lookAt(Vector3.zero, look).Rotation
+        local duration = 0.25 + math.random() * 0.2
+        local t0 = tick()
+        while true do
+            local a = math.clamp((tick() - t0) / duration, 0, 1)
+            local s = a * a * (3 - 2 * a)
+            root.CFrame = CFrame.new(root.Position) * startRot:Lerp(goalRot, s)
+            if a >= 1 then break end
+            RunService.Heartbeat:Wait()
+            ok, char, hum, root = stillOk(token)
+            if not ok then return end
+        end
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    -- is a new cast allowed from here? (on the spot, looking the saved way, last cast did not fail)
+    function hm.needAlign(root)
+        local s = hm.spot
+        if not s then return false end
+        if hm.needFace then return true end
+        if flatDist(root.Position, s.pos) > ALIGN_DIST then return true end
+        local look = flat(root.CFrame.LookVector)
+        if not look then return true end
+        return look:Dot(s.look) < math.cos(math.rad(ALIGN_ANGLE))
+    end
+
+    -- go back to the spot (walk, or snap when very far) and face the sea
+    function hm.align(why)
+        if hm.busy or not hm.spot then return end
+        local spot = hm.spot
+        hm.busy = true
+        hm.text = why or "Facing the sea..."
+        hm.token = hm.token + 1
+        local token = hm.token
+        task.spawn(function()
+            local okRun, err = pcall(function()
+                local ok, char, hum, root = stillOk(token)
+                if not ok then return end
+                local d = flatDist(root.Position, spot.pos)
+                if d > TELEPORT_BACK then
+                    root.CFrame = CFrame.lookAt(spot.pos, spot.pos + spot.look)
+                    task.wait(0.4)
+                elseif d > ALIGN_DIST then
+                    walkTo(token, spot.pos, 6 + d / 6)
+                end
+                faceSpot(token, spot.look)
+                hm.needFace = false
+            end)
+            if not okRun then lastErr = err end
+            hm.busy = false
+        end)
+    end
+
+    -- the break itself
+    function hm.startBreak()
+        if hm.busy then return end
+        if not hm.spot then hm.setSpotHere() end   -- no verified cast yet: use where we stand now
+        local spot = hm.spot
+        if not spot then
+            hm.schedule(tick())
+            return
+        end
+        hm.busy = true
+        hm.text = "Break: stretching legs..."
+        hm.token = hm.token + 1
+        local token = hm.token
+        task.spawn(function()
+            local okRun, err = pcall(function()
+                local legs = math.random(2, 4)
+                for i = 1, legs do
+                    local ok, char, hum, root = stillOk(token)
+                    if not ok then return end
+                    local to = pickTarget(char, root.Position, spot)
+                    if not to then break end
+                    hm.text = string.format("Break: walking (%d/%d)", i, legs)
+                    if not walkTo(token, to, 4) then return end
+                    task.wait(0.3 + math.random() * 1.2)
+                    if math.random() < 0.15 then
+                        local ok2, _, hum2 = stillOk(token)
+                        if ok2 then hum2.Jump = true end
+                        task.wait(0.6)
+                    end
+                end
+                hm.text = "Break: back to the fishing spot"
+                task.wait(0.3 + math.random() * 0.8)
+                walkTo(token, spot.pos, 8)
+                faceSpot(token, spot.look)
+                hm.needFace = false
+            end)
+            if not okRun then lastErr = err end
+            hm.busy = false
+            hm.schedule(tick())
+        end)
+    end
+
+    -- called every frame from the engine: did the last cast really start fishing?
+    function hm.verify(now, isFishing)
+        local p = hm.pendingCast
+        if not p then return end
+        if isFishing then
+            hm.pendingCast = nil
+            hm.fails = 0
+            hm.needFace = false
+            if not hm.spot then hm.spot = hm.makeSpot(p.cf) end   -- first good cast = the fishing spot
+        elseif now - p.t >= CAST_VERIFY then
+            hm.pendingCast = nil
+            hm.fails = hm.fails + 1
+            hm.needFace = true
+        end
+    end
+end
+hm.schedule(tick())
+
+---------------------------------------------------------------------
 -- Engine (one Heartbeat connection)
 ---------------------------------------------------------------------
 local function engineStep()
@@ -1533,6 +1776,7 @@ local function engineStep()
     local isCD = char:GetAttribute("CDForTheNextThrow") == true
     local isSwimming = char:GetAttribute("Swimming") == true
     local hasRod = (rodType == "Fishing Rod")
+    hm.verify(now, isFishing)
 
     detailText = "Rod: " .. tostring(rodType) .. " | Fishing: " .. yn(isFishing) ..
         " | Minigame: " .. yn(isMinigame) .. " | CD: " .. yn(isCD)
@@ -1632,7 +1876,8 @@ local function engineStep()
     ----------------------------------------------------------------
     if isFishing then
         idleSince = nil
-        if Config.AutoCast and fishingStartTime > 0 and (now - fishingStartTime >= RECAST_TIMEOUT) then
+        if Config.AutoCast and fishingStartTime > 0 and (now - fishingStartTime >= RECAST_TIMEOUT)
+            and char:GetAttribute("Retractable") == true then
             fishingStartTime = now
             local fishing = Events:FindFirstChild("Fishing")
             if fishing then pcall(function() fishing:FireServer(root.CFrame) end) end
@@ -1667,6 +1912,15 @@ local function engineStep()
         statusText = "Swimming - can't cast"
         return
     end
+    if hm.busy then
+        statusText = hm.text
+        return
+    end
+    if Config.IdleMotion and now >= hm.nextAt then
+        hm.startBreak()
+        statusText = hm.text
+        return
+    end
     if isCD then
         statusText = "Throw cooldown..."
         return
@@ -1692,9 +1946,21 @@ local function engineStep()
         return
     end
 
-    pcall(function() fishing:FireServer(root.CFrame) end)
+    if Config.FaceSea and hm.needAlign(root) then
+        hm.align("Facing the sea...")
+        statusText = hm.text
+        return
+    end
+
+    local castCF = root.CFrame
+    pcall(function() fishing:FireServer(castCF) end)
+    hm.pendingCast = { t = now, cf = castCF }
     lastCastTime = now
-    statusText = "Casting!"
+    if hm.fails >= 3 then
+        statusText = "Casting (last " .. hm.fails .. " casts failed - face the sea, then press Set fishing spot)"
+    else
+        statusText = "Casting!"
+    end
 end
 
 -- per-frame part of the Anchor Bar (keeps the bar centred before the game redraws it)
@@ -2166,6 +2432,8 @@ toggleButton("Auto Cast Rod", 32, Config.AutoCast, function(v)
     Config.AutoCast = v
     equipAttempts = 0
     idleSince = nil
+    hm.resetSpot()              -- stand facing the sea when you switch it on: the first good cast saves the spot
+    hm.schedule(tick())
 end)
 makeSlider("Cast Delay", "s", DELAY_MIN, DELAY_MAX, DELAY_STEP, DELAY_STEP, 1, Config.CastDelay, function(v)
     Config.CastDelay = v
@@ -2173,6 +2441,14 @@ end)
 toggleButton("Stop When Inventory Full", 28, Config.StopWhenFull, function(v)
     play(clickSound)
     Config.StopWhenFull = v
+end)
+toggleButton("Face the sea before every cast (saved fishing spot)", 30, Config.FaceSea, function(v)
+    play(clickSound)
+    Config.FaceSea = v
+end)
+actionButton("📍 Set fishing spot here (position + facing)", 28, function()
+    play(clickSound)
+    hm.setSpotHere()
 end)
 
 -- 🚀 Minigame ---------------------------------------------------------
@@ -2410,18 +2686,24 @@ toggleButton("Leave game AFK mode automatically (else it rejoins you after 15 mi
     play(clickSound)
     Config.LeaveGameAFK = v
 end)
-toggleButton("Idle motion (camera sweep + jump)", 30, Config.IdleMotion, function(v)
+toggleButton("Human break (stop casting, walk a few steps, come back)", 34, Config.IdleMotion, function(v)
     play(clickSound)
     Config.IdleMotion = v
-    afk.lastMotion = tick()
+    hm.schedule(tick())
 end)
-makeSlider("Idle motion every", "min", 5, 60, 5, 5, 0, Config.IdleMotionMin, function(v)
-    Config.IdleMotionMin = v
-    afk.lastMotion = tick()
+makeSlider("Break: earliest every", "min", 2, 30, 1, 1, 0, Config.BreakMin, function(v)
+    Config.BreakMin = v
+    if Config.BreakMax < v then Config.BreakMax = v end
 end)
-actionButton("▶ Do it once now", 26, function()
+makeSlider("Break: latest every", "min", 2, 45, 1, 1, 0, Config.BreakMax, function(v)
+    Config.BreakMax = math.max(v, Config.BreakMin)
+end)
+makeSlider("Break: walk radius", "studs", 4, 12, 1, 1, 0, Config.BreakWalk, function(v)
+    Config.BreakWalk = v
+end)
+actionButton("▶ Take a break at the next free moment", 26, function()
     play(clickSound)
-    afk.motion()
+    hm.nextAt = 0
 end)
 ui.afk = infoCard({ { "afk", "Status" } }, 0.17).afk
 
