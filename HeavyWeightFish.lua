@@ -1,5 +1,5 @@
 --[[
-    ★ PPINGYYY AUTO FISH ★  v2
+    ★ PPINGYYY AUTO FISH ★  v8 (collapsible UI + Quest tab)
     Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling + Anti-AFK + Money Stats + Discord Webhook + Taoist/Maoshan ESP + "4896 Polar Bear" intro
 
     Game logic used (taken from the working fishing script):
@@ -66,6 +66,13 @@ local Config = {
     HealBelow = 50,           -- percent of max HP
     HoldOnInvincible = true,  -- do not spend attack skills while the boss is invincible (~3 s after it restores its HP)
     FpsCap = 30,              -- used by "Limit FPS"
+    AutoTicketQuest = false,  -- Quest tab: accept / turn in the Ticket Quest and fish at the farm spot meanwhile
+    TicketDifficulty = "Hard",
+    QuestFarm = true,
+    QuestTravel = "Teleport", -- "Teleport" or "Boat" (experimental)
+    QuestFarmPos = { 1362, 9, 268 },   -- Battlefield fishing spot (cast position seen in the log: 1362.21, 9.28, 267.87)
+    QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
+    BoatName = "White Heaven Kunfish", -- the boat you own / use at the boat NPC
     BlackFps = 20,            -- FPS cap used automatically while the black screen is on
     BlackHideUi = true,       -- black screen also switches the game's own UI + Roblox core UI off (less to draw)
     BlackHud = false,         -- show the small money/status text on the black screen (false = completely black)
@@ -922,11 +929,15 @@ end
 -- new objects: the server streams / clones them in, children arrive after the model, so check again shortly after
 conns[#conns + 1] = Workspace.DescendantAdded:Connect(function(d)
     if not running then return end
+    -- only models whose NAME matches count: the game spawns thousands of skill-effect models per hour and
+    -- scheduling a task for each one is wasted CPU/memory
     if d:IsA("Model") then
-        task.delay(0.6, function() if running then espConsider(d) end end)
+        if espKindOf(d.Name) then
+            task.delay(0.6, function() if running then espConsider(d) end end)
+        end
     elseif d:IsA("Humanoid") then
         local m = d.Parent
-        if m then task.delay(0.2, function() if running then espConsider(m) end end) end
+        if m and espKindOf(m.Name) then task.delay(0.2, function() if running then espConsider(m) end end) end
     end
 end)
 
@@ -1764,6 +1775,7 @@ local function engineStep()
         return
     end
     hookRemotes(Events)
+    if ui.questBusy then statusText = "Quest: travelling / talking to NPC"; detailText = ""; return end
 
     local pData = getData()
     local pg = lp:FindFirstChild("PlayerGui")
@@ -2150,7 +2162,7 @@ end
 
 local function addTab(name, label, order)
     local btn = new("TextButton", {
-        Size = UDim2.new(0.2, -3.2, 1, 0), LayoutOrder = order, Text = label, Font = Enum.Font.GothamBold, TextSize = 10,
+        Size = UDim2.new(1 / 6, -3.4, 1, 0), LayoutOrder = order, Text = label, Font = Enum.Font.GothamBold, TextSize = 10,
         BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, BorderSizePixel = 0, AutoButtonColor = false,
     }, TabBar)
     corner(btn, 7)
@@ -2180,7 +2192,8 @@ addTab("Fish", "🎣 Fish", 1)
 addTab("Skill", "⚡ Skill", 2)
 addTab("Sell", "💰 Sell", 3)
 addTab("Stats", "📊 Stats", 4)
-addTab("Misc", "⚙ Misc", 5)
+addTab("Quest", "🎫 Quest", 5)
+addTab("Misc", "⚙ Misc", 6)
 
 local function setPage(name)
     Page = pages[name]
@@ -2423,6 +2436,45 @@ local function infoCard(rows, labelFrac)
     return setters
 end
 
+-- collapsible group of sub-options: ui.sub("Options") ... widgets ... ui.endSub()
+-- (closed by default; the header is a small arrow button that sits under the feature's main switch)
+function ui.sub(title)
+    local parentBody = Body
+    local holder = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = nextOrder(),
+    }, parentBody)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5) }, holder)
+    local header = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1, Text = "", BackgroundColor3 = Color3.fromRGB(20, 28, 34),
+        BorderSizePixel = 0, AutoButtonColor = false,
+    }, holder)
+    corner(header, 6)
+    local label = new("TextLabel", {
+        Size = UDim2.new(1, -12, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1,
+        Text = "▸  " .. title, TextColor3 = COL_TEXT2, Font = Enum.Font.GothamMedium, TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, header)
+    local inner = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 2, Visible = false,
+    }, holder)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, inner)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }, inner)
+    header.MouseButton1Click:Connect(function()
+        play(clickSound)
+        inner.Visible = not inner.Visible
+        label.Text = (inner.Visible and "▾  " or "▸  ") .. title
+        label.TextColor3 = inner.Visible and COL_GREEN or COL_TEXT2
+    end)
+    ui.subParent = parentBody
+    Body = inner
+end
+function ui.endSub()
+    if ui.subParent then
+        Body = ui.subParent
+        ui.subParent = nil
+    end
+end
+
 -- tab: Fish ----------------------------------------------------------
 setPage("Fish")
 -- 🎣 Auto Cast ------------------------------------------------------
@@ -2435,6 +2487,7 @@ toggleButton("Auto Cast Rod", 32, Config.AutoCast, function(v)
     hm.resetSpot()              -- stand facing the sea when you switch it on: the first good cast saves the spot
     hm.schedule(tick())
 end)
+ui.sub("Auto Cast options (delay / face the sea / fishing spot)")
 makeSlider("Cast Delay", "s", DELAY_MIN, DELAY_MAX, DELAY_STEP, DELAY_STEP, 1, Config.CastDelay, function(v)
     Config.CastDelay = v
 end)
@@ -2450,6 +2503,7 @@ actionButton("📍 Set fishing spot here (position + facing)", 28, function()
     play(clickSound)
     hm.setSpotHere()
 end)
+ui.endSub()
 
 -- 🚀 Minigame ---------------------------------------------------------
 section("🚀 MINIGAME")
@@ -2457,12 +2511,14 @@ toggleButton("Anchor Bar (Minigame)", 32, Config.AnchorBar, function(v)
     play(clickSound)
     Config.AnchorBar = v
 end)
+ui.sub("Anchor Bar movement (range / speed)")
 makeSlider("Bar Jump Range (left/right)", "%", 0, 35, 1, 5, 0, Config.BarSway, function(v)
     Config.BarSway = v
 end)
 makeSlider("Bar Jump Speed", "/s", 1, 12, 1, 1, 0, Config.BarSwaySpeed, function(v)
     Config.BarSwaySpeed = v
 end)
+ui.endSub()
 toggleButton("Auto Slam / Crits", 28, Config.AutoSlam, function(v)
     play(clickSound)
     Config.AutoSlam = v
@@ -2481,6 +2537,7 @@ toggleButton("AUTO SKILL (uses every ready skill)", 32, Config.AutoSkill, functi
     play(skillSound)
     Config.AutoSkill = v
 end)
+ui.sub("Skill mode + role of each key (Z X C V)")
 local ModeBtn = actionButton("", 28, function() end)
 ModeBtn.TextSize = 10
 local function refreshMode()
@@ -2521,6 +2578,8 @@ for i, key in ipairs(SKILL_KEYS) do
     end)
 end
 
+ui.endSub()
+
 -- live slot status
 do
     local e = infoCard({ { "Z", "Key Z" }, { "X", "Key X" }, { "C", "Key C" }, { "V", "Key V" } }, 0.2)
@@ -2533,9 +2592,11 @@ toggleButton("Use Heal slots when HP is low", 30, Config.HealEnabled, function(v
     play(clickSound)
     Config.HealEnabled = v
 end)
+ui.sub("Heal options")
 makeSlider("Heal below", "%", 10, 90, 5, 5, 0, Config.HealBelow, function(v)
     Config.HealBelow = v
 end)
+ui.endSub()
 toggleButton("Hold attacks while boss is invincible (~3s)", 30, Config.HoldOnInvincible, function(v)
     play(clickSound)
     Config.HoldOnInvincible = v
@@ -2561,6 +2622,7 @@ toggleButton("Auto Sell Fish", 32, Config.AutoSell, function(v)
     play(sellSound)
     Config.AutoSell = v
 end)
+ui.sub("Sell options (interval / sell now)")
 makeSlider("Sell Interval", "s", SELL_MIN, SELL_MAX, 1, 5, 0, Config.SellInterval, function(v)
     Config.SellInterval = v
 end)
@@ -2568,13 +2630,16 @@ actionButton("💰 Sell Now & Teleport to Nana", 30, function()
     play(sellSound)
     sellNow()
 end)
+ui.endSub()
 toggleButton("Auto Favourite Fish (protect from selling)", 28, Config.AutoFavourite, function(v)
     play(clickSound)
     Config.AutoFavourite = v
 end)
+ui.sub("Favourite target")
 makeDropdown("Favourite Target", FISH_LIST, Config.FavouriteFishName, function(name)
     Config.FavouriteFishName = name
 end)
+ui.endSub()
 toggleButton("Material Farming (protect craft fish)", 28, Config.MaterialFarming, function(v)
     play(clickSound)
     Config.MaterialFarming = v
@@ -2636,6 +2701,7 @@ toggleButton("Webhook Reports", 32, Config.WebhookEnabled, function(v)
     live.last = 0
     if v and not validWebhook(Config.WebhookUrl) then webhookStatus = "Set a valid webhook URL first" end
 end)
+ui.sub("Webhook options (live mode / intervals / test)")
 toggleButton("Live mode (edits ONE message, no spam)", 30, Config.WebhookLive, function(v)
     play(clickSound)
     Config.WebhookLive = v
@@ -2668,6 +2734,7 @@ actionButton("🆕 Start a fresh live message", 26, function()
     markDirty()
     webhookStatus = "Next update creates a new message"
 end)
+ui.endSub()
 ui.hook = infoCard({ { "next", "Next update" }, { "status", "Last result" } }, 0.28)
 uiReady = true
 
@@ -2691,6 +2758,7 @@ toggleButton("Human break (stop casting, walk a few steps, come back)", 34, Conf
     Config.IdleMotion = v
     hm.schedule(tick())
 end)
+ui.sub("Human break options (interval / radius / now)")
 makeSlider("Break: earliest every", "min", 2, 30, 1, 1, 0, Config.BreakMin, function(v)
     Config.BreakMin = v
     if Config.BreakMax < v then Config.BreakMax = v end
@@ -2705,6 +2773,7 @@ actionButton("▶ Take a break at the next free moment", 26, function()
     play(clickSound)
     hm.nextAt = 0
 end)
+ui.endSub()
 ui.afk = infoCard({ { "afk", "Status" } }, 0.17).afk
 
 -- 🔮 ESP ------------------------------------------------------------
@@ -2719,6 +2788,7 @@ toggleButton("Maoshan ESP", 28, Config.ESP_Maoshan, function(v)
     Config.ESP_Maoshan = v
     espLastScan = 0
 end)
+ui.sub("ESP options (tracer / alert)")
 toggleButton("Tracer line to the NPC", 28, Config.ESP_Tracer, function(v)
     play(clickSound)
     Config.ESP_Tracer = v
@@ -2727,9 +2797,398 @@ toggleButton("Alert when one appears", 28, Config.ESP_Notify, function(v)
     play(clickSound)
     Config.ESP_Notify = v
 end)
+ui.endSub()
 do
     local e = infoCard({ { "taoist", "Taoist" }, { "maoshan", "Maoshan" } })
     ui.esp = { taoist = e.taoist, maoshan = e.maoshan }
+end
+
+-- tab: Quest ---------------------------------------------------------
+-- Ticket Quest automation. Everything below was derived from a real log of doing the quest by hand:
+--   talk to NPC  -> server sends StartDialogue(npcName, npcModel, {text, {{label, type, flag}, ...}}, args)
+--   pick option  -> client sends ChooseDialogueOption(npcName, optionIndex, optionType, args)
+--   "Quest" -> (turn in if finished / "come back in m:ss" if on cooldown / accept menu) -> "HardAcceptQuest" / "EasyAcceptQuest"
+--   boat         -> SpawnBoat NPC option "BoatShop" -> server VisibleUI("BoatShop","LocationN") -> Spawn(boatName,"LocationN")
+-- The quest data lives in Data[UserId].Quest.Main["Hard Ticket Quest"] ("description,amount,type,target"), cooldown in
+-- Data[UserId].TicketQuestCooldown (server time).
+setPage("Quest")
+do
+    local qs = { status = "Idle", dlg = nil, dlgAt = 0, shop = nil, busy = false, lastTalk = 0, boatNote = "" }
+    local TICKET_NPC = "Ticket Quest Giver"
+    local QUEST_NAMES = { "Hard Ticket Quest", "Easy Ticket Quest" }
+    -- boat waypoints (x, z), taken from the positions logged while sailing by hand
+    local ROUTE_TO_FARM = { Vector2.new(-360, 182), Vector2.new(61, 399), Vector2.new(395, 229), Vector2.new(755, 143), Vector2.new(1155, 185), Vector2.new(1341, 216) }
+    local ROUTE_TO_QUEST = { Vector2.new(1311, 362), Vector2.new(953, 75), Vector2.new(830, 553), Vector2.new(564, 313), Vector2.new(146, 167) }
+
+    local function myRoot() local c = lp.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+    local function myHum() local c = lp.Character; return c and c:FindFirstChildOfClass("Humanoid") end
+    local function dist(pos) local r = myRoot(); return r and (r.Position - pos).Magnitude or math.huge end
+    local function farmPos() local p = Config.QuestFarmPos; return Vector3.new(p[1], p[2], p[3]) end
+    local function waitFor(cond, timeout)
+        local t0 = tick()
+        while tick() - t0 < timeout and running do
+            if cond() then return true end
+            task.wait(0.1)
+        end
+        return cond()
+    end
+    local function tp(pos, look)
+        local r = myRoot()
+        if r then
+            pcall(function() r.AssemblyLinearVelocity = Vector3.zero end)
+            local at = pos + Vector3.new(0, 3, 0)
+            if look then
+                r.CFrame = CFrame.lookAt(at, at + Vector3.new(look[1], 0, look[2]))
+            else
+                r.CFrame = CFrame.new(at) * (r.CFrame - r.CFrame.Position)   -- keep the way we were facing
+            end
+        end
+    end
+    -- the Human-break system remembers WHERE every cast is thrown from; tell it about the farm spot (or forget it)
+    local function respot(keep)
+        if not hm then return end
+        pcall(function() if keep then hm.setSpotHere() else hm.resetSpot() end end)
+    end
+    local function walkTo(pos, timeout)
+        local h = myHum()
+        if not h then return false end
+        local t0, lastMove = tick(), 0
+        while tick() - t0 < timeout and running do
+            if dist(pos) < 8 then return true end
+            if tick() - lastMove > 1.5 then lastMove = tick(); pcall(function() h:MoveTo(pos) end) end
+            task.wait(0.2)
+        end
+        return dist(pos) < 14
+    end
+
+    -- ticket quest state ------------------------------------------------------------------
+    local function readTicket()
+        local out = { active = false, done = false, cooldown = 0, objs = {} }
+        local data = getData()
+        if not data then return out end
+        local cd = data:FindFirstChild("TicketQuestCooldown")
+        if cd then out.cooldown = math.max(0, (tonumber(cd.Value) or 0) - Workspace:GetServerTimeNow()) end
+        local quest = data:FindFirstChild("Quest")
+        local main = quest and quest:FindFirstChild("Main")
+        if not main then return out end
+        for _, name in ipairs(QUEST_NAMES) do
+            local q = main:FindFirstChild(name)
+            if q then
+                out.active, out.name, out.done = true, name, true
+                local objF = q:FindFirstChild("Objective")
+                local n = 1
+                while objF do
+                    local ov = objF:FindFirstChild(tostring(n))
+                    if not ov then break end
+                    local parts = string.split(tostring(ov.Value), ",")
+                    local o = { desc = tostring(ov.Value), amount = 1, kind = "?", target = "" }
+                    for i = 2, #parts do
+                        if tonumber(parts[i]) and parts[i + 1] and string.match(parts[i + 1], "^%a+$") then
+                            o.desc = table.concat(parts, ",", 1, i - 1)
+                            o.amount = tonumber(parts[i])
+                            o.kind = parts[i + 1]
+                            o.target = table.concat(parts, ",", i + 2)
+                            break
+                        end
+                    end
+                    local pv = q:FindFirstChild(tostring(n))
+                    o.progress = pv and tonumber(pv.Value) or 0
+                    if o.progress < o.amount then out.done = false end
+                    out.objs[#out.objs + 1] = o
+                    n = n + 1
+                end
+                if #out.objs == 0 then out.done = false end
+                break
+            end
+        end
+        return out
+    end
+
+    -- dialogue --------------------------------------------------------------------------------
+    task.spawn(function()
+        local ev = RS:WaitForChild("Events", 30)
+        local sd = ev and ev:WaitForChild("StartDialogue", 30)
+        local vu = ev and ev:WaitForChild("VisibleUI", 30)
+        if sd then
+            conns[#conns + 1] = sd.OnClientEvent:Connect(function(npcName, model, body, args)
+                qs.dlg = { npc = npcName, model = model, opts = (type(body) == "table" and body[2]) or {}, args = args }
+                qs.dlgAt = tick()
+            end)
+        end
+        if vu then
+            conns[#conns + 1] = vu.OnClientEvent:Connect(function(name, loc)
+                if name == "BoatShop" then qs.shop = { loc = loc, at = tick() } end
+            end)
+        end
+    end)
+
+    local function ticketChooser(opts)
+        local want = (Config.TicketDifficulty == "Hard") and "HardAcceptQuest" or "EasyAcceptQuest"
+        for i, o in ipairs(opts) do if o[2] == want then return i, o[2] end end
+        for i, o in ipairs(opts) do if o[2] == "Quest" then return i, o[2] end end
+        return nil
+    end
+
+    local function talk(model, npcName, chooser, maxSteps)
+        local prompt = nil
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then prompt = d; break end
+        end
+        if not prompt then return false, "NPC has no ProximityPrompt" end
+        if not fireproximityprompt then return false, "executor has no fireproximityprompt" end
+        local t0 = qs.dlgAt
+        pcall(fireproximityprompt, prompt)
+        if not waitFor(function() return qs.dlgAt > t0 and qs.dlg and qs.dlg.npc == npcName end, 4) then
+            return false, "no dialogue opened (too far away?)"
+        end
+        local ev = RS:FindFirstChild("Events") and RS.Events:FindFirstChild("ChooseDialogueOption")
+        if not ev then return false, "ChooseDialogueOption missing" end
+        for _ = 1, maxSteps or 4 do
+            local d = qs.dlg
+            local idx, typ = chooser(d.opts)
+            if not idx then return true, "dialogue finished" end
+            local before = qs.dlgAt
+            pcall(function() ev:FireServer(npcName, idx, typ, d.args) end)
+            if typ == "BoatShop" then return true, "boat shop" end
+            if not waitFor(function() return qs.dlgAt > before end, 3) then return true, "no follow-up" end
+        end
+        return true, "ok"
+    end
+
+    local function ticketNpc()
+        local npcF = Workspace:FindFirstChild("NPC")
+        local fnF = npcF and npcF:FindFirstChild("Function")
+        return fnF and fnF:FindFirstChild(TICKET_NPC)
+    end
+    local function npcPos(model)
+        local r = model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
+        return r and r.Position
+    end
+
+    -- boat --------------------------------------------------------------------------------------
+    local function sail(spawnNpc, route, exitPos)
+        local npcF = Workspace:FindFirstChild("NPC")
+        local sbF = npcF and npcF:FindFirstChild("SpawnBoat")
+        local npc = sbF and sbF:FindFirstChild(spawnNpc)
+        local pos = npcPos(npc)
+        if not pos then return false, "boat NPC not found" end
+        if dist(pos) > 8 and not walkTo(pos + Vector3.new(3, 0, 3), 45) then tp(pos + Vector3.new(3, 0, 3)); task.wait(1) end
+        qs.shop = nil
+        local ok, why = talk(npc, "SpawnBoat", function(opts)
+            for i, o in ipairs(opts) do if o[2] == "BoatShop" then return i, o[2] end end
+            return nil
+        end, 1)
+        if not ok then return false, why end
+        if not waitFor(function() return qs.shop ~= nil end, 5) then return false, "boat shop did not open" end
+        local Events = RS:FindFirstChild("Events")
+        local spawnR = Events and Events:FindFirstChild("Spawn")
+        if not spawnR then return false, "Spawn remote missing" end
+        local loc = qs.shop.loc
+        pcall(function() spawnR:FireServer(Config.BoatName, loc) end)
+        local boat = nil
+        if not waitFor(function()
+            local bF = Workspace:FindFirstChild("Boat")
+            local lF = bF and bF:FindFirstChild(tostring(loc))
+            boat = lF and lF:FindFirstChild("Boat_" .. lp.UserId)
+            return boat ~= nil and boat:FindFirstChild("VehicleSeat") ~= nil and boat:FindFirstChild("Root") ~= nil
+        end, 12) then return false, "boat did not appear (is '" .. tostring(Config.BoatName) .. "' your boat?)" end
+        local seat, h = boat.VehicleSeat, myHum()
+        if not h then return false, "no humanoid" end
+        tp(seat.Position + Vector3.new(0, 1, 0))
+        if not waitFor(function() return h.SeatPart == seat end, 4) then
+            pcall(function() seat:Sit(h) end)
+            if not waitFor(function() return h.SeatPart == seat end, 3) then return false, "could not sit in the boat" end
+        end
+        local root = boat.Root
+        local bv = root:WaitForChild("BodyVelocity", 6)
+        local ao = root:WaitForChild("AlignOrientation", 6)
+        if not (bv and ao) then return false, "boat has no BodyVelocity/AlignOrientation" end
+        local cfg = boat:FindFirstChild("Configuration")
+        local ms = cfg and cfg:FindFirstChild("MaxSpeed")
+        local speed = ((ms and ms.Value) or 60) * 0.95
+        local wp, state = 1, nil
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            if not running or not seat.Parent or h.SeatPart ~= seat then state = state or "left the boat"; conn:Disconnect(); return end
+            local p, target = seat.Position, route[wp]
+            local d = Vector3.new(target.X - p.X, 0, target.Z - p.Z)
+            if d.Magnitude < 70 then
+                wp = wp + 1
+                if wp > #route then state = "arrived"; bv.Velocity = Vector3.zero; conn:Disconnect(); return end
+                target = route[wp]
+                d = Vector3.new(target.X - p.X, 0, target.Z - p.Z)
+            end
+            local dir = d.Unit
+            ao.CFrame = CFrame.fromOrientation(0, math.atan2(-dir.X, -dir.Z), 0)
+            local look = seat.CFrame.LookVector
+            look = Vector3.new(look.X, 0, look.Z)
+            if look.Magnitude > 0.01 then look = look.Unit end
+            bv.Velocity = Vector3.new(look.X * speed, bv.Velocity.Y, look.Z * speed)
+        end)
+        local t0, lastP, lastT = tick(), seat.Position, tick()
+        while state == nil and running and tick() - t0 < 300 do
+            task.wait(1)
+            qs.boatNote = "sailing " .. wp .. "/" .. #route
+            if tick() - lastT >= 8 then
+                if (seat.Position - lastP).Magnitude < 15 then state = "stuck" end
+                lastP, lastT = seat.Position, tick()
+            end
+        end
+        pcall(function() conn:Disconnect() end)
+        qs.boatNote = ""
+        pcall(function() bv.Velocity = Vector3.zero end)
+        local exitR = Events:FindFirstChild("BoatExitSeat")
+        if exitR and h.SeatPart == seat then pcall(function() exitR:FireServer() end) end
+        waitFor(function() return h.SeatPart == nil end, 4)
+        if state ~= "arrived" then return false, "boat trip " .. tostring(state or "timed out") end
+        if exitPos then
+            if not walkTo(exitPos, 40) then tp(exitPos) end
+        end
+        return true, "arrived"
+    end
+
+    -- travel (teleport or boat, with teleport as the fallback) -----------------------------------
+    local function goFarm()
+        local fp = farmPos()
+        if dist(fp) < 60 then return end
+        if Config.QuestTravel == "Boat" then
+            local npc = ticketNpc()
+            local np = npcPos(npc)
+            if np and dist(np) < 700 then
+                local ok, why = sail("Chu Xin 1", ROUTE_TO_FARM, fp)
+                if ok then respot(true); return end
+                qs.status = "boat failed (" .. tostring(why) .. ") -> teleport"
+            end
+        end
+        tp(fp, Config.QuestFarmLook)
+        task.wait(1)
+        respot(true)
+    end
+    local function goNpc()
+        local npc = ticketNpc()
+        local np = npcPos(npc)
+        if not np then qs.status = "Ticket NPC not found"; return false end
+        respot(false)
+        if dist(np) < 12 then return true end
+        if Config.QuestTravel == "Boat" and dist(farmPos()) < 700 then
+            local ok, why = sail("Chu Xin 9", ROUTE_TO_QUEST, np + Vector3.new(5, 0, 5))
+            if ok and dist(np) < 14 then return true end
+            if not ok then qs.status = "boat failed (" .. tostring(why) .. ") -> teleport" end
+        end
+        tp(np + Vector3.new(5, 0, 5))
+        task.wait(1.2)
+        return true
+    end
+
+    -- one decision step ----------------------------------------------------------------------------
+    local function step()
+        local char = lp.Character
+        if not char then return end
+        if char:GetAttribute("Minigame") == true then qs.status = "waiting (fish on the line)"; return end
+        local t = readTicket()
+        if t.active and not t.done then
+            qs.status = "working on the quest"
+            if Config.QuestFarm and dist(farmPos()) > 80 then
+                ui.questBusy = true
+                goFarm()
+                ui.questBusy = false
+            end
+        elseif (t.active and t.done) or t.cooldown <= 0 then
+            if tick() - qs.lastTalk < 25 then qs.status = "waiting (talked just now)"; return end
+            qs.status = t.active and "turning in the quest" or ("accepting a " .. Config.TicketDifficulty .. " quest")
+            ui.questBusy = true
+            qs.lastTalk = tick()
+            if goNpc() then
+                local ok, why = talk(ticketNpc(), TICKET_NPC, ticketChooser, 4)
+                qs.status = ok and ("talked to NPC: " .. tostring(why)) or ("talk failed: " .. tostring(why))
+                task.wait(1)
+                if Config.QuestFarm and dist(farmPos()) > 80 then goFarm() end
+            end
+            ui.questBusy = false
+        else
+            qs.status = "cooldown - fishing at the farm spot"
+            if Config.QuestFarm and dist(farmPos()) > 80 then
+                ui.questBusy = true
+                goFarm()
+                ui.questBusy = false
+            end
+        end
+    end
+
+    local function guarded(fn)
+        if qs.busy then return end
+        qs.busy = true
+        task.spawn(function()
+            local ok, err = pcall(fn)
+            if not ok then qs.status = "error: " .. tostring(err) end
+            ui.questBusy = false
+            qs.busy = false
+        end)
+    end
+
+    -- UI ----------------------------------------------------------------------------------------------
+    section("🎫 TICKET QUEST")
+    local info = infoCard({
+        { "state", "State" }, { "quest", "Quest" }, { "obj", "Task" }, { "prog", "Progress" }, { "cd", "Cooldown" }, { "pos", "Distance to farm spot" },
+    }, 0.38)
+    toggleButton("Auto Ticket Quest (accept / turn in / farm)", 34, Config.AutoTicketQuest, function(v)
+        play(clickSound)
+        Config.AutoTicketQuest = v
+    end)
+    ui.sub("Quest options (difficulty / travel / farm spot / manual)")
+    toggleButton("Fish at the farm spot while working / waiting", 30, Config.QuestFarm, function(v)
+        play(clickSound)
+        Config.QuestFarm = v
+    end)
+    makeDropdown("Difficulty", { "Hard", "Easy" }, Config.TicketDifficulty, function(v) Config.TicketDifficulty = v end)
+    makeDropdown("Travel", { "Teleport", "Boat" }, Config.QuestTravel, function(v) Config.QuestTravel = v end)
+    actionButton("📍 Save my current position as the farm spot", 30, function()
+        play(clickSound)
+        local r = myRoot()
+        if r then
+            Config.QuestFarmPos = { math.floor(r.Position.X), math.floor(r.Position.Y), math.floor(r.Position.Z) }
+            local lv = r.CFrame.LookVector
+            Config.QuestFarmLook = { lv.X, lv.Z }
+        end
+    end)
+    actionButton("➡ Go to the farm spot now", 28, function()
+        play(clickSound)
+        guarded(function() ui.questBusy = true; goFarm() end)
+    end)
+    actionButton("➡ Go to the Ticket NPC and talk now", 28, function()
+        play(clickSound)
+        guarded(function()
+            ui.questBusy = true
+            qs.lastTalk = tick()
+            if goNpc() then
+                local ok, why = talk(ticketNpc(), TICKET_NPC, ticketChooser, 4)
+                qs.status = ok and ("talked to NPC: " .. tostring(why)) or ("talk failed: " .. tostring(why))
+            end
+        end)
+    end)
+    ui.endSub()
+
+    local function fmtCd(s)
+        s = math.floor(s)
+        return string.format("%d:%02d", math.floor(s / 60), s % 60)
+    end
+    task.spawn(function()
+        while running do
+            task.wait(1.5)
+            pcall(function()
+                local t = readTicket()
+                local o = t.objs[1]
+                info.state(qs.status .. (qs.boatNote ~= "" and (" [" .. qs.boatNote .. "]") or ""))
+                info.quest(t.active and t.name or "none")
+                info.obj(o and (o.desc .. (o.target ~= "" and (" [" .. o.kind .. ": " .. o.target .. "]") or (" [" .. o.kind .. "]"))) or "-")
+                info.prog(o and (math.floor(o.progress) .. " / " .. o.amount .. (t.done and "  DONE" or "")) or "-")
+                info.cd(t.cooldown > 0 and fmtCd(t.cooldown) or "ready")
+                local d = dist(farmPos())
+                info.pos(d == math.huge and "-" or (math.floor(d) .. " studs"))
+                if Config.AutoTicketQuest and not qs.busy then guarded(step) end
+            end)
+        end
+    end)
 end
 
 selectTab("Fish")
@@ -2743,6 +3202,7 @@ do
     end)
     ui.setBlack = setBlackVisual
 end
+ui.sub("Black screen options (hide UI / status text / FPS)")
 toggleButton("Black screen: also hide game UI + Roblox UI (saves more)", 30, Config.BlackHideUi, function(v)
     play(clickSound)
     Config.BlackHideUi = v
@@ -2755,6 +3215,7 @@ makeSlider("Black screen FPS", "fps", 5, 60, 5, 5, 0, Config.BlackFps, function(
     Config.BlackFps = v
     perf.refreshFps()
 end)
+ui.endSub()
 perf.vis = {}
 do
     local _, v1 = toggleButton("Low graphics (shadows, effects, water)", 30, false, function(v)
