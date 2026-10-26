@@ -1628,12 +1628,67 @@ do
             end
         end
         conn:Disconnect()
+        local reached = false
         pcall(function()
             local c = lp.Character
             local h = c and c:FindFirstChildOfClass("Humanoid")
             local r = c and c:FindFirstChild("HumanoidRootPart")
-            if h and r then h:MoveTo(r.Position) end   -- stop where we are
+            if h and r then
+                reached = flatDist(r.Position, target) < 3
+                h:MoveTo(r.Position)   -- stop where we are
+            end
         end)
+        return alive, reached
+    end
+
+    -- long way / obstacles: follow a Roblox path (jumps over things like a player would), no teleport
+    local function walkPath(token, target, timeout)
+        local t0 = tick()
+        local ok, char, hum, root = stillOk(token)
+        if not ok then return false, false end
+        local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+        local okP = pcall(function() path:ComputeAsync(root.Position, target) end)
+        if not okP or path.Status ~= Enum.PathStatus.Success then
+            return walkTo(token, target, timeout)      -- no path: just try straight
+        end
+        local wps = path:GetWaypoints()
+        for i = 2, #wps do
+            if tick() - t0 > timeout then break end
+            local wp = wps[i]
+            local ok2, _, h2 = stillOk(token)
+            if not ok2 then return false, false end
+            if wp.Action == Enum.PathWaypointAction.Jump then h2.Jump = true end
+            local alive = walkTo(token, wp.Position, 5)
+            if not alive then return false, false end
+            if math.random() < 0.04 then task.wait(0.2 + math.random() * 0.6) end   -- tiny hesitation
+        end
+        local ok3, _, _, r3 = stillOk(token)
+        local reached = ok3 and flatDist(r3.Position, target) < 3
+        return ok3, reached
+    end
+
+    -- a human never walks a ruler-straight line: bend the way through 1-2 random side points,
+    -- sometimes stop for a moment on the way
+    local function wanderTo(token, to, spot)
+        local ok, char, hum, root = stillOk(token)
+        if not ok then return false end
+        local from = root.Position
+        local d = flatDist(from, to)
+        if d > 6 then
+            local dir = Vector3.new(to.X - from.X, 0, to.Z - from.Z).Unit
+            local side = Vector3.new(-dir.Z, 0, dir.X)
+            local pts = math.random() < 0.4 and 2 or 1
+            for k = 1, pts do
+                local f = (k / (pts + 1)) * (0.8 + math.random() * 0.4)
+                local mid = from + dir * (d * f) + side * ((math.random() < 0.5 and -1 or 1) * (1 + math.random() * 3))
+                if targetOk(char, root.Position, mid, spot) then
+                    local alive = walkTo(token, mid, 4)
+                    if not alive then return false end
+                    if math.random() < 0.25 then task.wait(0.3 + math.random() * 1.0) end
+                end
+            end
+        end
+        local alive = walkTo(token, to, 5)
         return alive
     end
 
@@ -1681,12 +1736,30 @@ do
                 local ok, char, hum, root = stillOk(token)
                 if not ok then return end
                 local d = flatDist(root.Position, spot.pos)
-                if d > TELEPORT_BACK then
-                    root.CFrame = CFrame.lookAt(spot.pos, spot.pos + spot.look)
-                    task.wait(0.4)
-                elseif d > ALIGN_DIST then
-                    walkTo(token, spot.pos, 6 + d / 6)
+                if d > ALIGN_DIST then
+                    -- always walk back (path-finding for long ways); teleport only after 3 failed walks in a row
+                    local alive, reached = walkPath(token, spot.pos, 12 + d / 4)
+                    if not alive then return end
+                    if reached then
+                        hm.walkFails = 0
+                    else
+                        hm.walkFails = (hm.walkFails or 0) + 1
+                        if hm.walkFails >= 3 then
+                            hm.walkFails = 0
+                            if d > TELEPORT_BACK then
+                                root.CFrame = CFrame.lookAt(spot.pos, spot.pos + spot.look)
+                                task.wait(0.4)
+                            else
+                                -- cannot get back (blocked) and it is close: accept where we stand as the new spot
+                                -- instead of looping forever without casting
+                                local sp = hm.makeSpot(CFrame.new(root.Position) * (root.CFrame - root.CFrame.Position))
+                                if sp then sp.look = spot.look; hm.spot = sp; spot = sp end
+                            end
+                        end
+                    end
                 end
+                if not stillOk(token) then return end
+                task.wait(0.1 + math.random() * 0.3)
                 faceSpot(token, spot.look)
                 hm.needFace = false
             end)
@@ -1710,15 +1783,20 @@ do
         local token = hm.token
         task.spawn(function()
             local okRun, err = pcall(function()
-                local legs = math.random(2, 4)
+                local legs = math.random(2, 5)
                 for i = 1, legs do
                     local ok, char, hum, root = stillOk(token)
                     if not ok then return end
                     local to = pickTarget(char, root.Position, spot)
                     if not to then break end
                     hm.text = string.format("Break: walking (%d/%d)", i, legs)
-                    if not walkTo(token, to, 4) then return end
-                    task.wait(0.3 + math.random() * 1.2)
+                    if not wanderTo(token, to, spot) then return end
+                    task.wait(0.3 + math.random() * 1.8)
+                    if math.random() < 0.3 then          -- look around: turn to a random direction
+                        local a = math.random() * math.pi * 2
+                        faceSpot(token, Vector3.new(math.cos(a), 0, math.sin(a)))
+                        task.wait(0.3 + math.random() * 1.2)
+                    end
                     if math.random() < 0.15 then
                         local ok2, _, hum2 = stillOk(token)
                         if ok2 then hum2.Jump = true end
@@ -1727,7 +1805,9 @@ do
                 end
                 hm.text = "Break: back to the fishing spot"
                 task.wait(0.3 + math.random() * 0.8)
-                walkTo(token, spot.pos, 8)
+                local alive, reached = walkPath(token, spot.pos, 20)   -- walk all the way back, no teleport
+                if not alive then return end
+                task.wait(0.2 + math.random() * 0.6)
                 faceSpot(token, spot.look)
                 hm.needFace = false
             end)
