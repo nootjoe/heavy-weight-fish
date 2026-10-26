@@ -3061,7 +3061,10 @@ setPage("Quest")
         if not ok then return false, why end
         if not waitFor(function() return qs.shop ~= nil end, 5) then return false, "boat shop did not open" end
         local Events = RS:FindFirstChild("Events")
-        local spawnR = Events and Events:FindFirstChild("Spawn")
+        -- the shop UI fires ReplicatedStorage.Remotes.BoatShop.Spawn(boatName, "LocationN")  (not Events.Spawn)
+        local remF = RS:FindFirstChild("Remotes")
+        local shopF = remF and remF:FindFirstChild("BoatShop")
+        local spawnR = (shopF and shopF:FindFirstChild("Spawn")) or (Events and Events:FindFirstChild("Spawn"))
         if not spawnR then return false, "Spawn remote missing" end
         local loc = qs.shop.loc
         pcall(function() spawnR:FireServer(Config.BoatName, loc) end)
@@ -3160,6 +3163,28 @@ setPage("Quest")
         return true
     end
 
+    -- one visit to the Ticket NPC: turn in a finished quest and, when the cooldown allows it, take the NEXT
+    -- quest right away (same visit), and only then go back to the farm spot
+    local function visit()
+        if not goNpc() then return end
+        for round = 1, 3 do
+            local ok, why = talk(ticketNpc(), TICKET_NPC, ticketChooser, 4)
+            qs.status = ok and ("talked to NPC: " .. tostring(why)) or ("talk failed: " .. tostring(why))
+            if not ok then break end
+            task.wait(1.5)
+            local t = readTicket()
+            if t.active or t.cooldown > 0 then break end   -- accepted a quest, or the cooldown is running
+            -- turned in, nothing accepted yet: talk once more to take the next quest
+        end
+        local t = readTicket()
+        if not t.active and t.cooldown <= 0 then
+            qs.holdUntil = tick() + 300     -- could not accept (daily limit?): do not spam the NPC, farm for 5 min
+            qs.status = "no quest accepted - retry in 5 min"
+        end
+        task.wait(1)
+        if Config.QuestFarm and dist(farmPos()) > 80 then goFarm() end
+    end
+
     -- one decision step ----------------------------------------------------------------------------
     local function step()
         local char = lp.Character
@@ -3173,17 +3198,13 @@ setPage("Quest")
                 goFarm()
                 ui.questBusy = false
             end
-        elseif (t.active and t.done) or t.cooldown <= 0 then
+        elseif ((t.active and t.done) or t.cooldown <= 0) and tick() >= (qs.holdUntil or 0) then
             if tick() - qs.lastTalk < 25 then qs.status = "waiting (talked just now)"; return end
             qs.status = t.active and "turning in the quest" or ("accepting a " .. Config.TicketDifficulty .. " quest")
             ui.questBusy = true
             qs.lastTalk = tick()
-            if goNpc() then
-                local ok, why = talk(ticketNpc(), TICKET_NPC, ticketChooser, 4)
-                qs.status = ok and ("talked to NPC: " .. tostring(why)) or ("talk failed: " .. tostring(why))
-                task.wait(1)
-                if Config.QuestFarm and dist(farmPos()) > 80 then goFarm() end
-            end
+            visit()
+            qs.lastTalk = tick()
             ui.questBusy = false
         else
             qs.status = "cooldown - fishing at the farm spot"
@@ -3240,10 +3261,8 @@ setPage("Quest")
         guarded(function()
             ui.questBusy = true
             qs.lastTalk = tick()
-            if goNpc() then
-                local ok, why = talk(ticketNpc(), TICKET_NPC, ticketChooser, 4)
-                qs.status = ok and ("talked to NPC: " .. tostring(why)) or ("talk failed: " .. tostring(why))
-            end
+            qs.holdUntil = 0
+            visit()
         end)
     end)
     ui.endSub()
