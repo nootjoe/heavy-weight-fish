@@ -2892,7 +2892,7 @@ end
 -- The quest data lives in Data[UserId].Quest.Main["Hard Ticket Quest"] ("description,amount,type,target"), cooldown in
 -- Data[UserId].TicketQuestCooldown (server time).
 setPage("Quest")
-do
+;(function()
     local qs = { status = "Idle", dlg = nil, dlgAt = 0, shop = nil, busy = false, lastTalk = 0, boatNote = "" }
     local TICKET_NPC = "Ticket Quest Giver"
     local QUEST_NAMES = { "Hard Ticket Quest", "Easy Ticket Quest" }
@@ -3269,7 +3269,7 @@ do
             end)
         end
     end)
-end
+end)()
 
 selectTab("Fish")
 
