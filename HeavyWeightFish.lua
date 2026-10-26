@@ -3091,7 +3091,9 @@ setPage("Quest")
         local speed = ((ms and ms.Value) or 60) * 0.95
         local wp, state = 1, nil
         local conn
-        conn = RunService.Heartbeat:Connect(function()
+        -- the game's own boat script rewrites BodyVelocity / AlignOrientation every Heartbeat from the (zero) throttle,
+        -- which cancelled ours. PreSimulation runs right BEFORE physics, i.e. after theirs, so our values are the ones used.
+        conn = (RunService.PreSimulation or RunService.Stepped):Connect(function()
             if not running or not seat.Parent or h.SeatPart ~= seat then state = state or "left the boat"; conn:Disconnect(); return end
             local p, target = seat.Position, route[wp]
             local d = Vector3.new(target.X - p.X, 0, target.Z - p.Z)
