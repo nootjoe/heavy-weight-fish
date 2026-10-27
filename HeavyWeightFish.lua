@@ -69,7 +69,8 @@ local Config = {
     AutoTicketQuest = false,  -- Quest tab: accept / turn in the Ticket Quest and fish at the farm spot meanwhile
     TicketDifficulty = "Hard",
     QuestFarm = true,
-    QuestTravel = "Teleport", -- "Teleport" or "Boat" (experimental)
+    QuestTravel = "Boat",     -- "Boat" (default) or "Teleport"
+    QuestBait = "Auto",       -- bait to equip for "use bait" quests: "Off", "Auto" (cheapest you own) or a bait name
     QuestFarmPos = { 1362, 9, 268 },   -- Battlefield fishing spot (cast position seen in the log: 1362.21, 9.28, 267.87)
     QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
     BoatName = "White Heaven Kunfish", -- the boat you own / use at the boat NPC
@@ -91,7 +92,7 @@ local Config = {
     BreakMax = 15,            -- ... and latest (the real delay is random and sometimes falls outside this range)
     BreakWalk = 8,            -- studs: how far from the fishing spot a break may wander
     FaceSea = true,           -- before every cast: stand on the saved spot and look in the saved (sea) direction
-    LeaveGameAFK = false,     -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
+    LeaveGameAFK = true,      -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
     WebhookEnabled = false,
     WebhookUrl = "",
     WebhookInterval = 15,     -- minutes between webhook reports (normal mode)
@@ -1723,9 +1724,59 @@ do
         return look:Dot(s.look) < math.cos(math.rad(ALIGN_ANGLE))
     end
 
+    -- which way is the open sea? Look at 24 directions from `pos`: water (terrain water, or ground at / below sea level)
+    -- under the points 10..55 studs ahead scores, dry land ahead or a wall right in front costs. `prefer` (unit flat
+    -- vector) only breaks ties. Returns a unit flat vector, or nil when no direction looks like open water.
+    function hm.seaLook(pos, prefer)
+        local char = lp.Character
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local skip = { char }
+        local boats = workspace:FindFirstChild("Boat")
+        if boats then skip[#skip + 1] = boats end
+        params.FilterDescendantsInstances = skip
+        params.IgnoreWater = false
+        local level = 0
+        pcall(function() level = tonumber(game:GetService("ReplicatedStorage").SeaLevel.Value) or 0 end)
+        local best, bestScore = nil, -1e9
+        for i = 0, 23 do
+            local ang = i / 24 * math.pi * 2
+            local look = Vector3.new(-math.sin(ang), 0, -math.cos(ang))
+            local score = 0
+            for _, d in ipairs({ 10, 18, 28, 40, 55 }) do
+                local q = pos + look * d
+                local hit = workspace:Raycast(Vector3.new(q.X, pos.Y + 40, q.Z), Vector3.new(0, -140, 0), params)
+                if hit then
+                    if hit.Material == Enum.Material.Water or hit.Position.Y <= level + 1.5 then
+                        score = score + 1
+                    elseif hit.Position.Y > pos.Y - 3 then
+                        score = score - 2
+                    end
+                end
+            end
+            local wall = workspace:Raycast(pos + Vector3.new(0, 1.5, 0), look * 8, params)
+            if wall and wall.Material ~= Enum.Material.Water then score = score - 3 end
+            if prefer then score = score + 0.5 * look:Dot(prefer) end
+            if score > bestScore then best, bestScore = look, score end
+        end
+        if best and bestScore >= 3 then return best end
+        return nil
+    end
+
     -- go back to the spot (walk, or snap when very far) and face the sea
     function hm.align(why)
         if hm.busy or not hm.spot then return end
+        -- two casts in a row did not reach the water: the saved direction is wrong (cast hits the ground) -> look for the sea
+        if hm.fails >= 2 and not hm.reseaAt or (hm.fails >= 2 and tick() - hm.reseaAt > 4) then
+            hm.reseaAt = tick()
+            local okS, nl = pcall(hm.seaLook, hm.spot.pos, nil)
+            if okS and nl then
+                -- a failed direction is a bad candidate: if the finder insists on the same one, turn 90 degrees
+                if nl:Dot(hm.spot.look) > 0.95 then nl = rotated(nl, 90) end
+                hm.spot.look = nl
+                hm.fails = 0
+            end
+        end
         local spot = hm.spot
         hm.busy = true
         hm.text = why or "Facing the sea..."
@@ -2096,7 +2147,7 @@ end
 ---------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------
-local COL_CARD = Color3.fromRGB(21, 24, 33)
+local COL_CARD = Color3.fromRGB(20, 23, 31)
 local COL_ROW = Color3.fromRGB(30, 34, 46)
 local COL_STROKE = Color3.fromRGB(44, 50, 66)
 local COL_GREEN = Color3.fromRGB(0, 255, 150)
@@ -2104,7 +2155,8 @@ local COL_ON = Color3.fromRGB(0, 190, 105)
 local COL_OFF = Color3.fromRGB(66, 70, 88)
 local COL_RED = Color3.fromRGB(200, 60, 60)
 local COL_TEXT2 = Color3.fromRGB(140, 148, 165)
-local COL_TABON = Color3.fromRGB(0, 62, 42)
+local COL_TABON = Color3.fromRGB(30, 34, 46)
+local COL_TABOFF = Color3.fromRGB(14, 16, 22)
 
 local function new(class, props, parent)
     local inst = Instance.new(class)
@@ -2176,8 +2228,16 @@ espNotify = function(kind)
     end)
 end
 
-local FULL_SIZE = UDim2.new(0, 390, 0, 590)
-local MIN_SIZE = UDim2.new(0, 390, 0, 46)
+-- window size follows the screen: full size on a PC monitor, shrinks on a phone / small window
+function ui.fitSize()
+    local cam = workspace.CurrentCamera
+    local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
+    local mobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+    local w = math.clamp(vp.X - 24, 290, 390)
+    local h = math.clamp(vp.Y - (mobile and 30 or 60), 250, 590)
+    return UDim2.new(0, w, 0, h), UDim2.new(0, w, 0, 46), mobile, h
+end
+local FULL_SIZE, MIN_SIZE = ui.fitSize()
 
 local Main = new("Frame", {
     Size = FULL_SIZE, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
@@ -2185,29 +2245,24 @@ local Main = new("Frame", {
 }, sg)
 corner(Main, 12)
 new("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(19, 22, 31), Color3.fromRGB(10, 11, 15)), Rotation = 90 }, Main)
-new("UIStroke", { Color = COL_GREEN, Thickness = 1.5, Transparency = 0.2 }, Main)
+new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, Main)
 
 local TitleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundTransparency = 1 }, Main)
 new("TextLabel", {
-    Size = UDim2.new(1, -90, 0, 22), Position = UDim2.new(0, 14, 0, 6), BackgroundTransparency = 1,
-    Text = "★ PPINGYYY AUTO FISH", TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 15,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, TitleBar)
-new("TextLabel", {
-    Size = UDim2.new(1, -90, 0, 14), Position = UDim2.new(0, 14, 0, 27), BackgroundTransparency = 1,
-    Text = "4896 Polar Bear  •  Heavyweight Fishing", TextColor3 = COL_TEXT2, Font = Enum.Font.Gotham, TextSize = 10,
+    Size = UDim2.new(1, -90, 1, 0), Position = UDim2.new(0, 14, 0, 0), BackgroundTransparency = 1,
+    Text = "PPINGYYY  Auto Fish", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, TitleBar)
 
 local CloseBtn = new("TextButton", {
     Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -38, 0, 10), Text = "✕", Font = Enum.Font.GothamBold,
-    TextSize = 12, BackgroundColor3 = COL_RED, TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = true,
+    TextSize = 12, BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, AutoButtonColor = true,
 }, TitleBar)
 corner(CloseBtn, 6)
 
 local MinBtn = new("TextButton", {
     Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -70, 0, 10), Text = "—", Font = Enum.Font.GothamBold,
-    TextSize = 12, BackgroundColor3 = Color3.fromRGB(40, 90, 190), TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = true,
+    TextSize = 12, BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, AutoButtonColor = true,
 }, TitleBar)
 corner(MinBtn, 6)
 
@@ -2234,7 +2289,7 @@ local function selectTab(name)
     for n, tb in pairs(tabButtons) do
         local on = (n == name)
         TweenService:Create(tb.btn, TweenInfo.new(0.15), {
-            BackgroundColor3 = on and COL_TABON or COL_ROW, TextColor3 = on and COL_GREEN or COL_TEXT2,
+            BackgroundColor3 = on and COL_TABON or COL_TABOFF, TextColor3 = on and COL_GREEN or COL_TEXT2,
         }):Play()
         tb.line.Visible = on
     end
@@ -2242,13 +2297,13 @@ end
 
 local function addTab(name, label, order)
     local btn = new("TextButton", {
-        Size = UDim2.new(1 / 6, -3.4, 1, 0), LayoutOrder = order, Text = label, Font = Enum.Font.GothamBold, TextSize = 10,
-        BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, BorderSizePixel = 0, AutoButtonColor = false,
+        Size = UDim2.new(1 / 6, -3.4, 1, 0), LayoutOrder = order, Text = label, Font = Enum.Font.GothamBold, TextSize = 11,
+        BackgroundColor3 = COL_TABOFF, TextColor3 = COL_TEXT2, BorderSizePixel = 0, AutoButtonColor = false,
     }, TabBar)
     corner(btn, 7)
     local line = new("Frame", {
         Size = UDim2.new(1, -16, 0, 2), Position = UDim2.new(0, 8, 1, -4), BackgroundColor3 = COL_GREEN,
-        BorderSizePixel = 0, Visible = false,
+        BorderSizePixel = 0, Visible = false, BackgroundTransparency = 1,
     }, btn)
     corner(line, 1)
     local page = new("ScrollingFrame", {
@@ -2256,7 +2311,7 @@ local function addTab(name, label, order)
         ScrollBarImageColor3 = COL_GREEN, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false,
     }, Pages)
-    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10) }, page)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }, page)
     new("UIPadding", {
         PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 14), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10),
     }, page)
@@ -2268,12 +2323,12 @@ local function addTab(name, label, order)
     end)
 end
 
-addTab("Fish", "🎣 Fish", 1)
-addTab("Skill", "⚡ Skill", 2)
-addTab("Sell", "💰 Sell", 3)
-addTab("Stats", "📊 Stats", 4)
-addTab("Quest", "🎫 Quest", 5)
-addTab("Misc", "⚙ Misc", 6)
+addTab("Fish", "Fish", 1)
+addTab("Skill", "Skill", 2)
+addTab("Sell", "Sell", 3)
+addTab("Stats", "Stats", 4)
+addTab("Quest", "Quest", 5)
+addTab("Misc", "Misc", 6)
 
 local function setPage(name)
     Page = pages[name]
@@ -2287,20 +2342,15 @@ local function section(text)
         BorderSizePixel = 0, LayoutOrder = nextOrder(),
     }, Page)
     corner(card, 10)
-    new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, card)
-    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, card)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, card)
     new("UIPadding", {
-        PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
+        PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
     }, card)
-    local head = new("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, card)
-    local bar = new("Frame", {
-        Size = UDim2.new(0, 3, 0, 14), Position = UDim2.new(0, 0, 0.5, -7), BackgroundColor3 = COL_GREEN, BorderSizePixel = 0,
-    }, head)
-    corner(bar, 2)
+    text = string.gsub(text, "^[^%w]+", "")     -- plain title, no emoji
     new("TextLabel", {
-        Size = UDim2.new(1, -10, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1, Text = text,
-        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
-    }, head)
+        Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = string.upper(text), LayoutOrder = nextOrder(),
+        TextColor3 = COL_TEXT2, Font = Enum.Font.GothamBold, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
     Body = card
     return card
 end
@@ -2309,17 +2359,16 @@ end
 local function toggleButton(label, h, initial, onChange)
     local state = initial and true or false
     local row = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, math.max(h, 30)), LayoutOrder = nextOrder(), BackgroundColor3 = COL_ROW,
+        Size = UDim2.new(1, 0, 0, 30), LayoutOrder = nextOrder(), BackgroundTransparency = 1,
         BorderSizePixel = 0, Text = "", AutoButtonColor = false,
     }, Body)
-    corner(row, 7)
     new("TextLabel", {
-        Size = UDim2.new(1, -62, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1, Text = label,
-        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamMedium, TextSize = 11, TextWrapped = true,
+        Size = UDim2.new(1, -62, 1, 0), Position = UDim2.new(0, 2, 0, 0), BackgroundTransparency = 1, Text = label,
+        TextColor3 = Color3.fromRGB(230, 233, 240), Font = Enum.Font.Gotham, TextSize = 12, TextWrapped = true,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, row)
     local pill = new("Frame", {
-        Size = UDim2.new(0, 38, 0, 20), Position = UDim2.new(1, -48, 0.5, -10), BackgroundColor3 = COL_OFF, BorderSizePixel = 0,
+        Size = UDim2.new(0, 38, 0, 20), Position = UDim2.new(1, -40, 0.5, -10), BackgroundColor3 = COL_OFF, BorderSizePixel = 0,
     }, row)
     corner(pill, 10)
     local knob = new("Frame", {
@@ -2350,12 +2399,12 @@ local function toggleButton(label, h, initial, onChange)
 end
 
 local function actionButton(text, h, onClick)
+    text = string.gsub(text, "^[^%w]+", "")
     local btn = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, math.max(h, 28)), LayoutOrder = nextOrder(), Font = Enum.Font.GothamBold, TextSize = 11,
-        Text = text, BackgroundColor3 = Color3.fromRGB(24, 40, 48), TextColor3 = COL_GREEN, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 28), LayoutOrder = nextOrder(), Font = Enum.Font.GothamMedium, TextSize = 11,
+        Text = text, BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, BorderSizePixel = 0,
     }, Body)
     corner(btn, 7)
-    new("UIStroke", { Color = Color3.fromRGB(0, 110, 75), Thickness = 1 }, btn)
     btn.MouseButton1Click:Connect(onClick)
     return btn
 end
@@ -2366,27 +2415,31 @@ end
 
 -- slider with - / + buttons. Returns a setter.
 local function makeSlider(title, unit, vmin, vmax, snap, btnStep, decimals, initial, onChange)
-    local box = new("Frame", { Size = UDim2.new(1, 0, 0, 52), BackgroundColor3 = COL_ROW, BorderSizePixel = 0, LayoutOrder = nextOrder() }, Body)
-    corner(box, 6)
+    local box = new("Frame", { Size = UDim2.new(1, 0, 0, 50), BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = nextOrder() }, Body)
 
-    local label = new("TextLabel", {
-        Size = UDim2.new(1, -20, 0, 18), Position = UDim2.new(0, 10, 0, 4), BackgroundTransparency = 1,
-        Text = "", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 11,
+    new("TextLabel", {
+        Size = UDim2.new(0.62, 0, 0, 18), Position = UDim2.new(0, 2, 0, 2), BackgroundTransparency = 1,
+        Text = title, TextColor3 = Color3.fromRGB(230, 233, 240), Font = Enum.Font.Gotham, TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
+    }, box)
+    local label = new("TextLabel", {
+        Size = UDim2.new(0.38, 0, 0, 18), Position = UDim2.new(0.62, -2, 0, 2), BackgroundTransparency = 1,
+        Text = "", TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
     }, box)
 
     local function stepBtn(text, pos)
         local b = new("TextButton", {
             Size = UDim2.new(0, 26, 0, 22), Position = pos, Text = text, Font = Enum.Font.GothamBold,
-            TextSize = 14, BackgroundColor3 = Color3.fromRGB(40, 40, 45), TextColor3 = COL_GREEN, BorderSizePixel = 0,
+            TextSize = 14, BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, BorderSizePixel = 0,
         }, box)
         corner(b, 5)
         return b
     end
-    local minus = stepBtn("-", UDim2.new(0, 10, 0, 26))
-    local plus = stepBtn("+", UDim2.new(1, -36, 0, 26))
+    local minus = stepBtn("-", UDim2.new(0, 2, 0, 24))
+    local plus = stepBtn("+", UDim2.new(1, -28, 0, 24))
 
-    local hit = new("Frame", { Size = UDim2.new(1, -92, 0, 24), Position = UDim2.new(0, 46, 0, 25), BackgroundTransparency = 1 }, box)
+    local hit = new("Frame", { Size = UDim2.new(1, -86, 0, 24), Position = UDim2.new(0, 43, 0, 23), BackgroundTransparency = 1 }, box)
     local track = new("Frame", {
         Size = UDim2.new(1, 0, 0, 6), Position = UDim2.new(0, 0, 0.5, -3), BackgroundColor3 = Color3.fromRGB(45, 45, 50), BorderSizePixel = 0,
     }, hit)
@@ -2399,13 +2452,13 @@ local function makeSlider(title, unit, vmin, vmax, snap, btnStep, decimals, init
     }, track)
     corner(knob, 7)
 
-    local fmt = "%s: %." .. decimals .. "f %s   (%." .. decimals .. "f - %." .. decimals .. "f)"
+    local fmt = "%." .. decimals .. "f %s"
     local scale = 10 ^ decimals
     local function setValue(v)
         v = math.floor(v / snap + 0.5) * snap
         v = math.clamp(v, vmin, vmax)
         v = math.floor(v * scale + 0.5) / scale
-        label.Text = string.format(fmt, title, v, unit, vmin, vmax)
+        label.Text = string.format(fmt, v, unit)
         local p = (v - vmin) / (vmax - vmin)
         fill.Size = UDim2.new(p, 0, 1, 0)
         knob.Position = UDim2.new(p, 0, 0.5, 0)
@@ -2448,7 +2501,7 @@ local function makeDropdown(title, options, initial, onPick)
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, holder)
 
     local btn = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 1, Font = Enum.Font.GothamBold, TextSize = 10,
+        Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 1, Font = Enum.Font.GothamMedium, TextSize = 11,
         BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, BorderSizePixel = 0,
     }, holder)
     corner(btn, 6)
@@ -2462,7 +2515,7 @@ local function makeDropdown(title, options, initial, onPick)
 
     local optionButtons = {}
     local function refresh()
-        btn.Text = title .. ": " .. tostring(selected) .. (list.Visible and "  ^" or "  v")
+        btn.Text = title .. ":  " .. tostring(selected) .. (list.Visible and "   ▴" or "   ▾")
         for name, b in pairs(optionButtons) do
             b.TextColor3 = (name == selected) and COL_GREEN or Color3.new(1, 1, 1)
             b.BackgroundColor3 = (name == selected) and Color3.fromRGB(0, 70, 45) or COL_ROW
@@ -2525,20 +2578,20 @@ function ui.sub(title)
     }, parentBody)
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5) }, holder)
     local header = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1, Text = "", BackgroundColor3 = Color3.fromRGB(20, 28, 34),
+        Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1, Text = "", BackgroundTransparency = 1,
         BorderSizePixel = 0, AutoButtonColor = false,
     }, holder)
     corner(header, 6)
     local label = new("TextLabel", {
-        Size = UDim2.new(1, -12, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1,
-        Text = "▸  " .. title, TextColor3 = COL_TEXT2, Font = Enum.Font.GothamMedium, TextSize = 10,
+        Size = UDim2.new(1, -12, 1, 0), Position = UDim2.new(0, 2, 0, 0), BackgroundTransparency = 1,
+        Text = "▸  " .. title, TextColor3 = COL_TEXT2, Font = Enum.Font.GothamMedium, TextSize = 11,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, header)
     local inner = new("Frame", {
         Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 2, Visible = false,
     }, holder)
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, inner)
-    new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }, inner)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 4) }, inner)
     header.MouseButton1Click:Connect(function()
         play(clickSound)
         inner.Visible = not inner.Visible
@@ -2558,8 +2611,8 @@ end
 -- tab: Fish ----------------------------------------------------------
 setPage("Fish")
 -- 🎣 Auto Cast ------------------------------------------------------
-section("🎣 AUTO CAST")
-toggleButton("Auto Cast Rod", 32, Config.AutoCast, function(v)
+section("Auto cast")
+toggleButton("Auto cast", 32, Config.AutoCast, function(v)
     play(castSound)
     Config.AutoCast = v
     equipAttempts = 0
@@ -2567,43 +2620,43 @@ toggleButton("Auto Cast Rod", 32, Config.AutoCast, function(v)
     hm.resetSpot()              -- stand facing the sea when you switch it on: the first good cast saves the spot
     hm.schedule(tick())
 end)
-ui.sub("Auto Cast options (delay / face the sea / fishing spot)")
+ui.sub("Options")
 makeSlider("Cast Delay", "s", DELAY_MIN, DELAY_MAX, DELAY_STEP, DELAY_STEP, 1, Config.CastDelay, function(v)
     Config.CastDelay = v
 end)
-toggleButton("Stop When Inventory Full", 28, Config.StopWhenFull, function(v)
+toggleButton("Stop when inventory is full", 28, Config.StopWhenFull, function(v)
     play(clickSound)
     Config.StopWhenFull = v
 end)
-toggleButton("Face the sea before every cast (saved fishing spot)", 30, Config.FaceSea, function(v)
+toggleButton("Face the sea before each cast", 30, Config.FaceSea, function(v)
     play(clickSound)
     Config.FaceSea = v
 end)
-actionButton("📍 Set fishing spot here (position + facing)", 28, function()
+actionButton("Set fishing spot here", 28, function()
     play(clickSound)
     hm.setSpotHere()
 end)
 ui.endSub()
 
 -- 🚀 Minigame ---------------------------------------------------------
-section("🚀 MINIGAME")
-toggleButton("Anchor Bar (Minigame)", 32, Config.AnchorBar, function(v)
+section("Minigame")
+toggleButton("Anchor bar", 32, Config.AnchorBar, function(v)
     play(clickSound)
     Config.AnchorBar = v
 end)
-ui.sub("Anchor Bar movement (range / speed)")
-makeSlider("Bar Jump Range (left/right)", "%", 0, 35, 1, 5, 0, Config.BarSway, function(v)
+ui.sub("Options")
+makeSlider("Bar jump range", "%", 0, 35, 1, 5, 0, Config.BarSway, function(v)
     Config.BarSway = v
 end)
-makeSlider("Bar Jump Speed", "/s", 1, 12, 1, 1, 0, Config.BarSwaySpeed, function(v)
+makeSlider("Bar jump speed", "/s", 1, 12, 1, 1, 0, Config.BarSwaySpeed, function(v)
     Config.BarSwaySpeed = v
 end)
 ui.endSub()
-toggleButton("Auto Slam / Crits", 28, Config.AutoSlam, function(v)
+toggleButton("Auto slam / crits", 28, Config.AutoSlam, function(v)
     play(clickSound)
     Config.AutoSlam = v
 end)
-toggleButton("Auto Charge Durability", 28, Config.AutoCharge, function(v)
+toggleButton("Auto charge durability", 28, Config.AutoCharge, function(v)
     play(clickSound)
     Config.AutoCharge = v
 end)
@@ -2612,12 +2665,12 @@ end)
 setPage("Skill")
 do
 -- ⚡ Auto Skill ------------------------------------------------------
-section("⚡ AUTO SKILL")
-toggleButton("AUTO SKILL (uses every ready skill)", 32, Config.AutoSkill, function(v)
+section("Auto skill")
+toggleButton("Auto skill", 32, Config.AutoSkill, function(v)
     play(skillSound)
     Config.AutoSkill = v
 end)
-ui.sub("Skill mode + role of each key (Z X C V)")
+ui.sub("Keys and mode")
 local ModeBtn = actionButton("", 28, function() end)
 ModeBtn.TextSize = 10
 local function refreshMode()
@@ -2667,21 +2720,21 @@ do
 end
 
 -- boss / combat -------------------------------------------------------
-section("⚔ BOSS & COMBAT")
-toggleButton("Use Heal slots when HP is low", 30, Config.HealEnabled, function(v)
+section("Boss and combat")
+toggleButton("Heal when HP is low", 30, Config.HealEnabled, function(v)
     play(clickSound)
     Config.HealEnabled = v
 end)
-ui.sub("Heal options")
+ui.sub("Options")
 makeSlider("Heal below", "%", 10, 90, 5, 5, 0, Config.HealBelow, function(v)
     Config.HealBelow = v
 end)
 ui.endSub()
-toggleButton("Hold attacks while boss is invincible (~3s)", 30, Config.HoldOnInvincible, function(v)
+toggleButton("Pause attacks while boss is invincible", 30, Config.HoldOnInvincible, function(v)
     play(clickSound)
     Config.HoldOnInvincible = v
 end)
-toggleButton("Alert when secret bosses spawn", 30, Config.BossAlert, function(v)
+toggleButton("Alert on secret boss", 30, Config.BossAlert, function(v)
     play(clickSound)
     Config.BossAlert = v
 end)
@@ -2697,30 +2750,30 @@ end
 -- tab: Sell ----------------------------------------------------------
 setPage("Sell")
 -- 💰 Economy & Selling -----------------------------------------------
-section("💰 ECONOMY & SELLING")
-toggleButton("Auto Sell Fish", 32, Config.AutoSell, function(v)
+section("Selling")
+toggleButton("Auto sell", 32, Config.AutoSell, function(v)
     play(sellSound)
     Config.AutoSell = v
 end)
-ui.sub("Sell options (interval / sell now)")
-makeSlider("Sell Interval", "s", SELL_MIN, SELL_MAX, 1, 5, 0, Config.SellInterval, function(v)
+ui.sub("Options")
+makeSlider("Sell interval", "s", SELL_MIN, SELL_MAX, 1, 5, 0, Config.SellInterval, function(v)
     Config.SellInterval = v
 end)
-actionButton("💰 Sell Now & Teleport to Nana", 30, function()
+actionButton("Sell now (teleports to Nana)", 30, function()
     play(sellSound)
     sellNow()
 end)
 ui.endSub()
-toggleButton("Auto Favourite Fish (protect from selling)", 28, Config.AutoFavourite, function(v)
+toggleButton("Auto favourite fish", 28, Config.AutoFavourite, function(v)
     play(clickSound)
     Config.AutoFavourite = v
 end)
-ui.sub("Favourite target")
-makeDropdown("Favourite Target", FISH_LIST, Config.FavouriteFishName, function(name)
+ui.sub("Options")
+makeDropdown("Target fish", FISH_LIST, Config.FavouriteFishName, function(name)
     Config.FavouriteFishName = name
 end)
 ui.endSub()
-toggleButton("Material Farming (protect craft fish)", 28, Config.MaterialFarming, function(v)
+toggleButton("Material farming", 28, Config.MaterialFarming, function(v)
     play(clickSound)
     Config.MaterialFarming = v
 end)
@@ -2729,20 +2782,20 @@ end)
 setPage("Stats")
 do
 -- 📊 Money Stats --------------------------------------------------------
-section("📊 MONEY STATS")
+section("Money stats")
 ui.stats = infoCard({
     { "level", "Level" }, { "weather", "Weather" },
     { "cash", "Current Cash" }, { "net", "Net Cash (session)" }, { "cph", "Cash / hour" },
     { "fish", "Total Fish Caught" }, { "fsess", "Fish (session)" }, { "fph", "Fish / hour" },
     { "time", "Session Time" }, { "rod", "Equipped Rod" }, { "bait", "Equipped Bait" },
 })
-actionButton("🔄 Reset Session", 26, function()
+actionButton("Reset session", 26, function()
     play(clickSound)
     resetSession()
 end)
 
 -- 🔔 Discord Webhook ------------------------------------------------------
-section("🔔 DISCORD WEBHOOK")
+section("Discord webhook")
 
 local urlBox = new("TextBox", {
     Size = UDim2.new(1, 0, 0, 30), LayoutOrder = nextOrder(), BackgroundColor3 = COL_ROW, BorderSizePixel = 0, Text = "",
@@ -2774,30 +2827,30 @@ urlBox.FocusLost:Connect(function()
     urlBox.Text = maskedUrl(Config.WebhookUrl)
 end)
 
-toggleButton("Webhook Reports", 32, Config.WebhookEnabled, function(v)
+toggleButton("Webhook reports", 32, Config.WebhookEnabled, function(v)
     play(clickSound)
     Config.WebhookEnabled = v
     lastWebhookTime = tick()
     live.last = 0
     if v and not validWebhook(Config.WebhookUrl) then webhookStatus = "Set a valid webhook URL first" end
 end)
-ui.sub("Webhook options (live mode / intervals / test)")
-toggleButton("Live mode (edits ONE message, no spam)", 30, Config.WebhookLive, function(v)
+ui.sub("Options")
+toggleButton("Live mode (edit one message)", 30, Config.WebhookLive, function(v)
     play(clickSound)
     Config.WebhookLive = v
     live.last = 0
     markDirty()
 end)
-makeSlider("Live update every", "s", 10, 120, 5, 5, 0, Config.LiveInterval, function(v)
+makeSlider("Live update", "s", 10, 120, 5, 5, 0, Config.LiveInterval, function(v)
     Config.LiveInterval = v
     markDirty()
 end)
-makeSlider("Report Every (normal mode)", "min", WEBHOOK_MIN, WEBHOOK_MAX, 1, 5, 0, Config.WebhookInterval, function(v)
+makeSlider("Report every", "min", WEBHOOK_MIN, WEBHOOK_MAX, 1, 5, 0, Config.WebhookInterval, function(v)
     Config.WebhookInterval = v
     lastWebhookTime = tick()  -- changing the interval restarts the countdown
     markDirty()
 end)
-actionButton("📨 Send Test Report Now", 28, function()
+actionButton("Send test report", 28, function()
     play(sellSound)
     if Config.WebhookLive then
         live.last = 0
@@ -2807,7 +2860,7 @@ actionButton("📨 Send Test Report Now", 28, function()
         sendWebhook("test")
     end
 end)
-actionButton("🆕 Start a fresh live message", 26, function()
+actionButton("Start a new live message", 26, function()
     play(clickSound)
     live.id = ""
     live.last = 0
@@ -2823,33 +2876,33 @@ end
 -- tab: Misc ----------------------------------------------------------
 setPage("Misc")
 -- 🛡️ Anti AFK ----------------------------------------------------------
-section("🛡️ ANTI AFK")
-toggleButton("Anti-AFK (prevents the 20 min idle kick)", 28, Config.AntiAFK, function(v)
+section("Anti-AFK")
+toggleButton("Anti-AFK", 28, Config.AntiAFK, function(v)
     play(clickSound)
     Config.AntiAFK = v
     markDirty()
 end)
-toggleButton("Leave game AFK mode automatically (else it rejoins you after 15 min)", 34, Config.LeaveGameAFK, function(v)
+toggleButton("Leave game AFK mode automatically", 34, Config.LeaveGameAFK, function(v)
     play(clickSound)
     Config.LeaveGameAFK = v
 end)
-toggleButton("Human break (stop casting, walk a few steps, come back)", 34, Config.IdleMotion, function(v)
+toggleButton("Human break", 34, Config.IdleMotion, function(v)
     play(clickSound)
     Config.IdleMotion = v
     hm.schedule(tick())
 end)
-ui.sub("Human break options (interval / radius / now)")
-makeSlider("Break: earliest every", "min", 2, 30, 1, 1, 0, Config.BreakMin, function(v)
+ui.sub("Options")
+makeSlider("Earliest break", "min", 2, 30, 1, 1, 0, Config.BreakMin, function(v)
     Config.BreakMin = v
     if Config.BreakMax < v then Config.BreakMax = v end
 end)
-makeSlider("Break: latest every", "min", 2, 45, 1, 1, 0, Config.BreakMax, function(v)
+makeSlider("Latest break", "min", 2, 45, 1, 1, 0, Config.BreakMax, function(v)
     Config.BreakMax = math.max(v, Config.BreakMin)
 end)
-makeSlider("Break: walk radius", "studs", 4, 12, 1, 1, 0, Config.BreakWalk, function(v)
+makeSlider("Walk radius", "studs", 4, 12, 1, 1, 0, Config.BreakWalk, function(v)
     Config.BreakWalk = v
 end)
-actionButton("▶ Take a break at the next free moment", 26, function()
+actionButton("Take a break now", 26, function()
     play(clickSound)
     hm.nextAt = 0
 end)
@@ -2857,8 +2910,8 @@ ui.endSub()
 ui.afk = infoCard({ { "afk", "Status" } }, 0.17).afk
 
 -- 🔮 ESP ------------------------------------------------------------
-section("🔮 ESP")
-toggleButton("Taoist ESP (Taoist / Grand Angler)", 28, Config.ESP_Taoist, function(v)
+section("ESP")
+toggleButton("Taoist ESP", 28, Config.ESP_Taoist, function(v)
     play(clickSound)
     Config.ESP_Taoist = v
     espLastScan = 0
@@ -2868,12 +2921,12 @@ toggleButton("Maoshan ESP", 28, Config.ESP_Maoshan, function(v)
     Config.ESP_Maoshan = v
     espLastScan = 0
 end)
-ui.sub("ESP options (tracer / alert)")
-toggleButton("Tracer line to the NPC", 28, Config.ESP_Tracer, function(v)
+ui.sub("Options")
+toggleButton("Tracer line", 28, Config.ESP_Tracer, function(v)
     play(clickSound)
     Config.ESP_Tracer = v
 end)
-toggleButton("Alert when one appears", 28, Config.ESP_Notify, function(v)
+toggleButton("Alert when found", 28, Config.ESP_Notify, function(v)
     play(clickSound)
     Config.ESP_Notify = v
 end)
@@ -2924,21 +2977,227 @@ setPage("Quest")
             end
         end
     end
+    -- turn the character towards the open water (the saved direction can point at the ground)
+    local function faceSea()
+        local r = myRoot()
+        if not (r and hm and hm.seaLook) then return end
+        pcall(function()
+            local pref = Config.QuestFarmLook and Vector3.new(Config.QuestFarmLook[1], 0, Config.QuestFarmLook[2]) or nil
+            local look = hm.seaLook(r.Position, pref)
+            if look then r.CFrame = CFrame.lookAt(r.Position, r.Position + look) end
+        end)
+    end
     -- the Human-break system remembers WHERE every cast is thrown from; tell it about the farm spot (or forget it)
     local function respot(keep)
         if not hm then return end
         pcall(function() if keep then hm.setSpotHere() else hm.resetSpot() end end)
     end
+    -- in the water? (the game sets the Swimming attribute; the humanoid state is the backup)
+    local function swimming()
+        local c, h = lp.Character, myHum()
+        if c and c:GetAttribute("Swimming") == true then return true end
+        return h ~= nil and h:GetState() == Enum.HumanoidStateType.Swimming
+    end
+    -- climb out: look for dry ground around us (nearest ring first, the spot closest to `toward` wins), swim + jump
+    -- towards it, and hop onto it if the water will not let go after a few seconds
+    local function rescueWater(toward)
+        local r, h = myRoot(), myHum()
+        if not (r and h) then return false end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local skip = { lp.Character }
+        local boats = Workspace:FindFirstChild("Boat")
+        if boats then skip[#skip + 1] = boats end
+        params.FilterDescendantsInstances = skip
+        params.IgnoreWater = false
+        local best = nil
+        for _, rad in ipairs({ 12, 22, 36, 55, 80, 120, 170 }) do
+            for a = 0, 15 do
+                local ang = a / 16 * math.pi * 2
+                local x, z = r.Position.X + math.cos(ang) * rad, r.Position.Z + math.sin(ang) * rad
+                local hit = Workspace:Raycast(Vector3.new(x, r.Position.Y + 60, z), Vector3.new(0, -160, 0), params)
+                -- only shore we can really climb onto: not a roof / cliff (that was the "jumps way too high" bug)
+                local reach = math.max(r.Position.Y, 2) + 6
+                if hit and hit.Material ~= Enum.Material.Water and hit.Position.Y <= reach and hit.Position.Y > -8 then
+                    local d = (toward and (hit.Position - toward).Magnitude or rad) + hit.Position.Y * 2   -- lower ledge wins
+                    if not best or d < best.d then best = { pos = hit.Position, d = d } end
+                end
+            end
+            if best then break end
+        end
+        if not best then return false end
+        qs.status = "in the water - swimming to the shore"
+        local t0, lastJump = tick(), 0
+        while running and tick() - t0 < 9 and swimming() do
+            pcall(function() h:MoveTo(best.pos) end)
+            if tick() - lastJump > 0.9 then lastJump = tick(); pcall(function() h.Jump = true end) end
+            task.wait(0.15)
+        end
+        if swimming() then tp(best.pos - Vector3.new(0, 1.5, 0)) end      -- still in the water: put us on the shore
+        task.wait(0.3)
+        return true
+    end
+    -- get off the boat: the game's own way is the BoatExitSeat remote (it fires on Jump); retry until we are free
+    -- the boat shop window stays open after Spawn (it covers the screen) -> close it like the X button does
+    local function closeShop()
+        pcall(function()
+            local gui = lp:FindFirstChild("PlayerGui") and lp.PlayerGui:FindFirstChild("MainGui")
+            local menu = gui and gui:FindFirstChild("Menu")
+            local shop = menu and menu:FindFirstChild("BoatShop")
+            if not shop then return end
+            local c = shop:FindFirstChild("Close")
+            if c and firesignal then pcall(firesignal, c.MouseButton1Click) end
+            task.wait(0.3)
+            if shop.Visible then shop.Visible = false end
+            local black = menu:FindFirstChild("Black")
+            if black then
+                local other = false
+                for _, f in ipairs(menu:GetChildren()) do
+                    if f:IsA("Frame") and f.Visible and f ~= black and f.Name ~= "Info" then other = true end
+                end
+                if not other then black.Visible = false end
+            end
+        end)
+    end
+    local function leaveBoat(seat)
+        local Ev = RS:FindFirstChild("Events")
+        for _ = 1, 6 do
+            local h = myHum()
+            if not h or h.SeatPart ~= seat then return true end
+            local exitR = Ev and Ev:FindFirstChild("BoatExitSeat")
+            if exitR then pcall(function() exitR:FireServer() end) end
+            pcall(function() h.Jump = true; h:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            task.wait(0.8)
+        end
+        local h = myHum()
+        return h == nil or h.SeatPart ~= seat
+    end
+    -- an obstacle right in front: probe it with horizontal rays at rising heights. The first free probe tells how
+    -- tall it is. Low (a step, a crate, a kerb) -> one normal jump. Too tall -> do not jump, use a path around it.
+    local function obstacleHeight(toward)
+        local r, h = myRoot(), myHum()
+        if not (r and h) then return nil end
+        local d = Vector3.new(toward.X - r.Position.X, 0, toward.Z - r.Position.Z)
+        if d.Magnitude < 1 then return nil end
+        d = d.Unit
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { lp.Character }
+        local feet = r.Position.Y - (h.HipHeight + r.Size.Y / 2)
+        for _, hgt in ipairs({ 0.6, 1.8, 3.0, 4.2, 5.4, 6.6 }) do
+            local hit = Workspace:Raycast(Vector3.new(r.Position.X, feet + hgt, r.Position.Z), d * 3.5, params)
+            if not hit then return hgt end            -- free here: the obstacle is lower than this probe
+        end
+        return 99                                      -- blocked all the way up: a wall
+    end
+    -- walk a Roblox path (goes around things, jumps only where the path says so)
+    local function pathTo(pos, timeout)
+        local r, h = myRoot(), myHum()
+        if not (r and h) then return false end
+        local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+        local okP = pcall(function() path:ComputeAsync(r.Position, pos) end)
+        if not okP or path.Status ~= Enum.PathStatus.Success then return false end
+        local t0 = tick()
+        for i, wp in ipairs(path:GetWaypoints()) do
+            if not running or tick() - t0 > timeout then break end
+            if i > 1 then
+                if wp.Action == Enum.PathWaypointAction.Jump then pcall(function() h.Jump = true end) end
+                pcall(function() h:MoveTo(wp.Position) end)
+                local t1 = tick()
+                while running and tick() - t1 < 3 and tick() - t0 < timeout do
+                    local rr = myRoot()
+                    if rr and Vector3.new(rr.Position.X - wp.Position.X, 0, rr.Position.Z - wp.Position.Z).Magnitude < 3 then break end
+                    if swimming() then return false end
+                    task.wait(0.1)
+                end
+            end
+        end
+        return dist(pos) < 12
+    end
     local function walkTo(pos, timeout)
         local h = myHum()
         if not h then return false end
         local t0, lastMove = tick(), 0
+        local lastPos, lastAt, stuck = nil, tick(), 0
         while tick() - t0 < timeout and running do
             if dist(pos) < 8 then return true end
+            if swimming() then rescueWater(pos) end
             if tick() - lastMove > 1.5 then lastMove = tick(); pcall(function() h:MoveTo(pos) end) end
+            -- no progress for ~1 s while still far: an obstacle
+            local r = myRoot()
+            if r then
+                if not lastPos then lastPos = r.Position end
+                if tick() - lastAt >= 1 then
+                    if (r.Position - lastPos).Magnitude < 1.2 and dist(pos) > 10 then
+                        stuck = stuck + 1
+                        local oh = obstacleHeight(pos)
+                        if stuck == 1 and oh and oh <= 6.6 then
+                            pcall(function() h.Jump = true end)               -- one normal jump onto the step
+                        elseif stuck <= 3 then
+                            if not pathTo(pos, 15) then
+                                -- no path: sidestep sideways a little, then try again
+                                local rr = myRoot()
+                                if rr then
+                                    local dir = Vector3.new(pos.X - rr.Position.X, 0, pos.Z - rr.Position.Z).Unit
+                                    local side = Vector3.new(-dir.Z, 0, dir.X) * ((stuck % 2 == 0) and 8 or -8)
+                                    pcall(function() h:MoveTo(rr.Position + side + dir * 4) end)
+                                    task.wait(1.2)
+                                end
+                            end
+                        else
+                            return false                                      -- really stuck: caller teleports as the last resort
+                        end
+                    else
+                        stuck = 0
+                    end
+                    lastPos, lastAt = r.Position, tick()
+                end
+            end
             task.wait(0.2)
         end
         return dist(pos) < 14
+    end
+
+    -- bait: "Use bait N times" quests need a bait equipped; pick the one the player chose (or the cheapest owned) ---
+    local function baitList()
+        local out = {}
+        local data = getData()
+        local bf = data and data:FindFirstChild("Bait")
+        if not bf then return out end
+        for _, v in ipairs(bf:GetChildren()) do
+            local okV, val = pcall(function() return v.Value end)
+            local n = okV and tonumber(val) or nil
+            if not okV or n == nil or n > 0 then
+                local price = 0
+                pcall(function() price = require(RS.Info.Bait[v.Name]).Price or 0 end)
+                out[#out + 1] = { name = v.Name, count = n or 1, price = price }
+            end
+        end
+        table.sort(out, function(a, b)
+            if a.price ~= b.price then return a.price < b.price end
+            return a.name < b.name
+        end)
+        return out
+    end
+    local function ensureBait()
+        local choice = Config.QuestBait
+        if choice == "Off" then return end
+        if tick() - (qs.lastBait or 0) < 5 then return end
+        local data = getData()
+        local eq = data and data:FindFirstChild("EquippedBait")
+        if not eq then return end
+        local list = baitList()
+        local pick = nil
+        if choice ~= "Auto" then
+            for _, b in ipairs(list) do if b.name == choice then pick = b; break end end
+        end
+        pick = pick or list[1]                     -- chosen bait is used up (or Auto): cheapest bait that is left
+        if not pick then qs.status = "no bait in the backpack"; return end
+        if eq.Value == pick.name then return end
+        qs.lastBait = tick()
+        local ev = RS:FindFirstChild("Events")
+        local r = ev and ev:FindFirstChild("EquipBait")
+        if r then pcall(function() r:InvokeServer(pick.name) end) end
     end
 
     -- ticket quest state ------------------------------------------------------------------
@@ -3068,6 +3327,7 @@ setPage("Quest")
         if not spawnR then return false, "Spawn remote missing" end
         local loc = qs.shop.loc
         pcall(function() spawnR:FireServer(Config.BoatName, loc) end)
+        task.delay(1.2, closeShop)
         local boat = nil
         if not waitFor(function()
             local bF = Workspace:FindFirstChild("Boat")
@@ -3077,11 +3337,21 @@ setPage("Quest")
         end, 12) then return false, "boat did not appear (is '" .. tostring(Config.BoatName) .. "' your boat?)" end
         local seat, h = boat.VehicleSeat, myHum()
         if not h then return false, "no humanoid" end
-        tp(seat.Position + Vector3.new(0, 1, 0))
-        if not waitFor(function() return h.SeatPart == seat end, 4) then
+        task.wait(1.0)   -- the boat drops onto the water first: let it settle before sitting
+        local seated = false
+        for _ = 1, 4 do
+            local r = myRoot()
+            if r then
+                pcall(function() r.AssemblyLinearVelocity = Vector3.zero end)
+                r.CFrame = seat.CFrame * CFrame.new(0, 2, 0)
+            end
             pcall(function() seat:Sit(h) end)
-            if not waitFor(function() return h.SeatPart == seat end, 3) then return false, "could not sit in the boat" end
+            if waitFor(function() return h.SeatPart == seat end, 2) then
+                task.wait(0.8)
+                if h.SeatPart == seat then seated = true; break end   -- still sitting after a moment = really seated
+            end
         end
+        if not seated then return false, "could not sit in the boat" end
         local root = boat.Root
         local bv = root:WaitForChild("BodyVelocity", 6)
         local ao = root:WaitForChild("AlignOrientation", 6)
@@ -3096,38 +3366,69 @@ setPage("Quest")
         conn = (RunService.PreSimulation or RunService.Stepped):Connect(function()
             if not running or not seat.Parent or h.SeatPart ~= seat then state = state or "left the boat"; conn:Disconnect(); return end
             local p, target = seat.Position, route[wp]
-            local d = Vector3.new(target.X - p.X, 0, target.Z - p.Z)
+            local d = Vector3.new(target.X - p.X, 0, target.Y - p.Z)
             if d.Magnitude < 70 then
                 wp = wp + 1
                 if wp > #route then state = "arrived"; bv.Velocity = Vector3.zero; conn:Disconnect(); return end
                 target = route[wp]
-                d = Vector3.new(target.X - p.X, 0, target.Z - p.Z)
+                d = Vector3.new(target.X - p.X, 0, target.Y - p.Z)
             end
-            local dir = d.Unit
-            ao.CFrame = CFrame.fromOrientation(0, math.atan2(-dir.X, -dir.Z), 0)
-            local look = seat.CFrame.LookVector
-            look = Vector3.new(look.X, 0, look.Z)
-            if look.Magnitude > 0.01 then look = look.Unit end
-            bv.Velocity = Vector3.new(look.X * speed, bv.Velocity.Y, look.Z * speed)
+            -- steering is NOT done here any more: writing BodyVelocity / AlignOrientation ourselves only made the boat
+            -- go straight ahead. The game's own boat script steers from seat.SteerFloat (see the render-step below).
+        end)
+        -- also hold the throttle the way a player does (W), so the game's own boat script wants to move forward too
+        pcall(function()
+            RunService:BindToRenderStep("PPY_BoatThrottle", Enum.RenderPriority.Last.Value + 10, function()
+                pcall(function()
+                    local target = route[math.min(wp, #route)]
+                    local p, look = seat.Position, seat.CFrame.LookVector
+                    local want = math.atan2(-(target.X - p.X), -(target.Y - p.Z))   -- yaw whose look vector points at the waypoint (Vector2: .Y is z)
+                    local cur = math.atan2(-look.X, -look.Z)
+                    local err = (want - cur + math.pi) % (2 * math.pi) - math.pi     -- -pi..pi, > 0 = waypoint is to the left
+                    -- the game turns RIGHT for a positive steer (yaw -= steer * ...), so steer = -err
+                    local steer = math.clamp(-err * 1.6, -1, 1)
+                    if math.abs(err) < 0.04 then steer = 0 end
+                    seat.SteerFloat = steer
+                    seat.ThrottleFloat = (math.abs(err) > 1.0) and 0.5 or 1
+                end)
+            end)
         end)
         local t0, lastP, lastT = tick(), seat.Position, tick()
+        local firstCheck = true
         while state == nil and running and tick() - t0 < 300 do
             task.wait(1)
-            qs.boatNote = "sailing " .. wp .. "/" .. #route
-            if tick() - lastT >= 8 then
-                if (seat.Position - lastP).Magnitude < 15 then state = "stuck" end
+            local sp = (seat.Position - lastP).Magnitude / math.max(0.1, tick() - lastT)
+            qs.boatNote = string.format("sailing %d/%d  %.0f studs/s", wp, #route, sp)
+            -- console trace every 2 s, so a failed trip can be diagnosed from the executor console
+            qs.boatTick = (qs.boatTick or 0) + 1
+            if qs.boatTick % 2 == 0 then
+                local v = 0
+                pcall(function() v = seat.AssemblyLinearVelocity.Magnitude end)
+                print(string.format("[PPINGYYY boat] wp %d/%d pos(%d,%d,%d) speed %d throttle %s bv %d anchored %s owner %s",
+                    wp, #route, seat.Position.X, seat.Position.Y, seat.Position.Z, v, tostring(seat.ThrottleFloat),
+                    bv.Velocity.Magnitude, tostring(root.Anchored), tostring(pcall(function() return root:GetNetworkOwner() end))))
+            end
+            if tick() - lastT >= (firstCheck and 12 or 8) then
+                if (seat.Position - lastP).Magnitude < 12 then state = "stuck (boat not moving)" end
+                firstCheck = false
                 lastP, lastT = seat.Position, tick()
             end
         end
+        print("[PPINGYYY boat] trip ended: " .. tostring(state or (running and "timeout" or "stopped")))
+        pcall(function() RunService:UnbindFromRenderStep("PPY_BoatThrottle") end)
+        pcall(function() seat.ThrottleFloat = 0; seat.SteerFloat = 0 end)
         pcall(function() conn:Disconnect() end)
         qs.boatNote = ""
-        pcall(function() bv.Velocity = Vector3.zero end)
-        local exitR = Events:FindFirstChild("BoatExitSeat")
-        if exitR and h.SeatPart == seat then pcall(function() exitR:FireServer() end) end
-        waitFor(function() return h.SeatPart == nil end, 4)
+        qs.boatNote = "leaving the boat"
+        leaveBoat(seat)
+        qs.boatNote = ""
+        task.wait(0.5)
+        if swimming() then rescueWater(exitPos) end
         if state ~= "arrived" then return false, "boat trip " .. tostring(state or "timed out") end
         if exitPos then
-            if not walkTo(exitPos, 40) then tp(exitPos) end
+            walkTo(exitPos, 40)
+            if swimming() then rescueWater(exitPos); walkTo(exitPos, 20) end
+            if dist(exitPos) > 25 then tp(exitPos) end     -- last resort: could not walk the rest of the way
         end
         return true, "arrived"
     end
@@ -3141,12 +3442,14 @@ setPage("Quest")
             local np = npcPos(npc)
             if np and dist(np) < 700 then
                 local ok, why = sail("Chu Xin 1", ROUTE_TO_FARM, fp)
-                if ok then respot(true); return end
+                qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to farm)"
+                if ok then task.wait(0.3); faceSea(); respot(true); return end
                 qs.status = "boat failed (" .. tostring(why) .. ") -> teleport"
             end
         end
         tp(fp, Config.QuestFarmLook)
         task.wait(1)
+        faceSea()
         respot(true)
     end
     local function goNpc()
@@ -3157,6 +3460,7 @@ setPage("Quest")
         if dist(np) < 12 then return true end
         if Config.QuestTravel == "Boat" and dist(farmPos()) < 700 then
             local ok, why = sail("Chu Xin 9", ROUTE_TO_QUEST, np + Vector3.new(5, 0, 5))
+            qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to NPC)"
             if ok and dist(np) < 14 then return true end
             if not ok then qs.status = "boat failed (" .. tostring(why) .. ") -> teleport" end
         end
@@ -3192,7 +3496,14 @@ setPage("Quest")
         local char = lp.Character
         if not char then return end
         if char:GetAttribute("Minigame") == true then qs.status = "waiting (fish on the line)"; return end
+        if swimming() then
+            ui.questBusy = true
+            rescueWater(Config.QuestFarm and farmPos() or nil)
+            ui.questBusy = false
+            return
+        end
         local t = readTicket()
+        if t.active and not t.done and t.objs[1] and t.objs[1].kind == "UseBait" then pcall(ensureBait) end
         if t.active and not t.done then
             qs.status = "working on the quest"
             if Config.QuestFarm and dist(farmPos()) > 80 then
@@ -3230,22 +3541,38 @@ setPage("Quest")
     end
 
     -- UI ----------------------------------------------------------------------------------------------
-    section("🎫 TICKET QUEST")
+    section("Ticket quest")
     local info = infoCard({
-        { "state", "State" }, { "quest", "Quest" }, { "obj", "Task" }, { "prog", "Progress" }, { "cd", "Cooldown" }, { "pos", "Distance to farm spot" },
+        { "state", "State" }, { "quest", "Quest" }, { "obj", "Task" }, { "prog", "Progress" }, { "cd", "Cooldown" }, { "pos", "Farm distance" }, { "boat", "Last boat trip" },
     }, 0.38)
-    toggleButton("Auto Ticket Quest (accept / turn in / farm)", 34, Config.AutoTicketQuest, function(v)
+    toggleButton("Auto ticket quest", 34, Config.AutoTicketQuest, function(v)
         play(clickSound)
         Config.AutoTicketQuest = v
     end)
-    ui.sub("Quest options (difficulty / travel / farm spot / manual)")
-    toggleButton("Fish at the farm spot while working / waiting", 30, Config.QuestFarm, function(v)
+    ui.sub("Options")
+    toggleButton("Fish at the farm spot meanwhile", 30, Config.QuestFarm, function(v)
         play(clickSound)
         Config.QuestFarm = v
     end)
     makeDropdown("Difficulty", { "Hard", "Easy" }, Config.TicketDifficulty, function(v) Config.TicketDifficulty = v end)
     makeDropdown("Travel", { "Teleport", "Boat" }, Config.QuestTravel, function(v) Config.QuestTravel = v end)
-    actionButton("📍 Save my current position as the farm spot", 30, function()
+    do
+        -- bait for "use bait" quests: tap to cycle Off / Auto / each bait you own right now
+        local baitBtn
+        local function baitText()
+            return "Bait for use-bait quests:  " .. tostring(Config.QuestBait)
+        end
+        baitBtn = actionButton(baitText(), 28, function()
+            play(clickSound)
+            local opts = { "Off", "Auto" }
+            for _, b in ipairs(baitList()) do opts[#opts + 1] = b.name end
+            local idx = 1
+            for i, o in ipairs(opts) do if o == Config.QuestBait then idx = i end end
+            Config.QuestBait = opts[idx % #opts + 1]
+            baitBtn.Text = baitText()
+        end)
+    end
+    actionButton("Save this position as farm spot", 30, function()
         play(clickSound)
         local r = myRoot()
         if r then
@@ -3254,11 +3581,11 @@ setPage("Quest")
             Config.QuestFarmLook = { lv.X, lv.Z }
         end
     end)
-    actionButton("➡ Go to the farm spot now", 28, function()
+    actionButton("Go to farm spot", 28, function()
         play(clickSound)
         guarded(function() ui.questBusy = true; goFarm() end)
     end)
-    actionButton("➡ Go to the Ticket NPC and talk now", 28, function()
+    actionButton("Go to NPC and talk", 28, function()
         play(clickSound)
         guarded(function()
             ui.questBusy = true
@@ -3286,6 +3613,7 @@ setPage("Quest")
                 info.cd(t.cooldown > 0 and fmtCd(t.cooldown) or "ready")
                 local d = dist(farmPos())
                 info.pos(d == math.huge and "-" or (math.floor(d) .. " studs"))
+                info.boat(qs.boatResult or "-")
                 if Config.AutoTicketQuest and not qs.busy then guarded(step) end
             end)
         end
@@ -3295,7 +3623,7 @@ end)()
 selectTab("Fish")
 
 -- 🚀 Performance --------------------------------------------------------
-section("🚀 PERFORMANCE SAVER")
+section("Performance")
 do
     local _, setBlackVisual = toggleButton("Black screen (turns 3D rendering off)  [RightShift]", 34, false, function(v)
         play(clickSound)
@@ -3303,12 +3631,12 @@ do
     end)
     ui.setBlack = setBlackVisual
 end
-ui.sub("Black screen options (hide UI / status text / FPS)")
-toggleButton("Black screen: also hide game UI + Roblox UI (saves more)", 30, Config.BlackHideUi, function(v)
+ui.sub("Options")
+toggleButton("Hide game UI too", 30, Config.BlackHideUi, function(v)
     play(clickSound)
     Config.BlackHideUi = v
 end)
-toggleButton("Black screen: show money/status text (off = completely black)", 30, Config.BlackHud, function(v)
+toggleButton("Show status text (off = pure black)", 30, Config.BlackHud, function(v)
     play(clickSound)
     Config.BlackHud = v
 end)
@@ -3337,7 +3665,7 @@ do
     end)
     perf.vis = { lowgfx = v1, nofx = v2, mute = v3, fps = v4 }
 end
-actionButton("⚡ MAX SAVER: everything on (black + low gfx + no fx + mute + fps)", 34, function()
+actionButton("Max saver (everything on)", 34, function()
     play(clickSound)
     perf.setBlack(true); if ui.setBlack then ui.setBlack(true) end
     perf.setLowGfx(true); perf.setNoFx(true); perf.setMute(true); perf.setFps(true)
@@ -3359,7 +3687,6 @@ local StatusBox = new("Frame", {
     Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -106), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
 }, Main)
 corner(StatusBox, 10)
-new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, StatusBox)
 local StatusLabel = new("TextLabel", {
     Size = UDim2.new(1, -16, 0, 34), Position = UDim2.new(0, 8, 0, 4), BackgroundTransparency = 1, Text = "Status: ...",
     TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11, TextWrapped = true,
@@ -3374,12 +3701,11 @@ local DetailLabel = new("TextLabel", {
 -- dragging ----------------------------------------------------------
 -- a "move" handle along the bottom of the expanded window (the title bar drags too)
 local MoveBtn = new("TextButton", {
-    Size = UDim2.new(1, -20, 0, 24), Position = UDim2.new(0, 10, 1, -32), Text = "✥  Hold & drag here to move window",
-    Font = Enum.Font.GothamBold, TextSize = 11, BackgroundColor3 = COL_CARD, TextColor3 = COL_TEXT2,
+    Size = UDim2.new(1, -20, 0, 24), Position = UDim2.new(0, 10, 1, -32), Text = "Drag here to move",
+    Font = Enum.Font.Gotham, TextSize = 10, BackgroundColor3 = COL_CARD, TextColor3 = COL_TEXT2,
     AutoButtonColor = false,
 }, Main)
 corner(MoveBtn, 8)
-new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, MoveBtn)
 do
     local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
     for _, handle in ipairs({ TitleBar, MoveBtn }) do
@@ -3409,6 +3735,28 @@ end
 
 -- minimize / close / hide key ----------------------------------------
 local minimized = false
+do
+    local function applyFit()
+        local full, min, mobile, h = ui.fitSize()
+        FULL_SIZE, MIN_SIZE = full, min
+        local compact = h < 430            -- short screen (phone in landscape, small window): drop the extras
+        ui.compact = compact
+        Content.Size = UDim2.new(1, 0, 1, compact and -100 or -160)
+        StatusBox.Size = UDim2.new(1, -20, 0, compact and 38 or 66)
+        StatusBox.Position = UDim2.new(0, 10, 1, compact and -46 or -106)
+        StatusLabel.Size = UDim2.new(1, -16, 0, compact and 30 or 34)
+        DetailLabel.Visible = not compact
+        MoveBtn.Visible = (not compact) and not minimized
+        Main.Size = minimized and MIN_SIZE or FULL_SIZE
+    end
+    applyFit()
+    local function hook()
+        local cam = workspace.CurrentCamera
+        if cam then conns[#conns + 1] = cam:GetPropertyChangedSignal("ViewportSize"):Connect(applyFit) end
+    end
+    hook()
+    conns[#conns + 1] = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function() hook(); applyFit() end)
+end
 MinBtn.MouseButton1Click:Connect(function()
     play(clickSound)
     minimized = not minimized
@@ -3424,7 +3772,7 @@ MinBtn.MouseButton1Click:Connect(function()
             if running and not minimized then
                 Content.Visible = true
                 StatusBox.Visible = true
-                MoveBtn.Visible = true
+                MoveBtn.Visible = not ui.compact
             end
         end)
         MinBtn.Text = "—"
