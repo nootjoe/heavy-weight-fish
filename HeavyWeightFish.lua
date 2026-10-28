@@ -70,6 +70,9 @@ local Config = {
     TicketDifficulty = "Hard",
     QuestFarm = true,
     QuestTravel = "Boat",     -- "Boat" (default) or "Teleport"
+    AutoRhythm = true,        -- play the boss rhythm minigame (A / S / D notes) automatically
+    RhythmMiss = 1,           -- deliberate mistakes per rhythm game (0 = perfect)
+    QuestDelay = 1.2,         -- seconds between the clicks inside NPC dialogues (quest / boat), a little random on top
     QuestBait = "Auto",       -- bait to equip for "use bait" quests: "Off", "Auto" (cheapest you own) or a bait name
     QuestFarmPos = { 1362, 9, 268 },   -- Battlefield fishing spot (cast position seen in the log: 1362.21, 9.28, 267.87)
     QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
@@ -2738,6 +2741,126 @@ toggleButton("Alert on secret boss", 30, Config.BossAlert, function(v)
     play(clickSound)
     Config.BossAlert = v
 end)
+toggleButton("Auto rhythm game (boss phase 2)", 30, Config.AutoRhythm, function(v)
+    play(clickSound)
+    Config.AutoRhythm = v
+end)
+ui.sub("Options")
+makeSlider("Mistakes per game", "", 0, 3, 1, 1, 0, Config.RhythmMiss, function(v)
+    Config.RhythmMiss = v
+end)
+ui.endSub()
+-- Rhythm minigame (boss phase 2). What the game does (ClientModule.Fishing, Events.RhythmStart): notes fall down three lanes
+-- A / S / D (MainGui.Fishing.Rhythm.ProgressionA/S/D, a falling frame named "Note_FX"); a click on the lane button (or the
+-- key) calls TryHit: the note closest to the hit line within 0.22 is "hit" (Events.RhythmHit:FireServer("hit")), no note
+-- in range = "miss"; a note that falls past = "miss"; RED notes (hard mode) are traps - hitting one counts as a miss.
+-- We press the lane button when a note reaches the line (a little early / late at random), skip the red notes, and let
+-- a few chosen notes fall past on purpose so the run does not look perfect.
+;(function()
+    local LANES = { "A", "S", "D" }
+    local st = { on = false, count = 0, miss = {}, seen = setmetatable({}, { __mode = "k" }), lastPress = {} }
+    local function pickMisses()
+        st.miss = {}
+        local n = math.floor(Config.RhythmMiss or 0)
+        local tries = 0
+        while n > 0 and tries < 50 do
+            tries = tries + 1
+            local idx = math.random(12, 160)        -- which note of the run gets dropped
+            if not st.miss[idx] then st.miss[idx] = true; n = n - 1 end
+        end
+    end
+    local function press(rhythm, lane)
+        local fr = rhythm:FindFirstChild("Progression" .. lane)
+        local btn = fr and fr:FindFirstChild("Button")
+        if not btn then return false end
+        if firesignal then
+            local ok = pcall(firesignal, btn.MouseButton1Click)
+            if ok then return true end
+        end
+        if getconnections then
+            local done = false
+            local ok = pcall(function()
+                for _, c in ipairs(getconnections(btn.MouseButton1Click)) do
+                    pcall(function() c:Fire() end)
+                    done = true
+                end
+            end)
+            if ok and done then return true end
+        end
+        -- last resort: a real key press
+        local ok = pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendKeyEvent(true, Enum.KeyCode[lane], false, game)
+            task.wait(0.03)
+            vim:SendKeyEvent(false, Enum.KeyCode[lane], false, game)
+        end)
+        return ok
+    end
+    local function isTrap(note)
+        local c = note.BackgroundColor3
+        return c.R > 0.9 and c.G < 0.3 and c.B < 0.3
+    end
+    task.spawn(function()
+        local ev = RS:WaitForChild("Events", 30)
+        local rs = ev and ev:WaitForChild("RhythmStart", 30)
+        local stop = ev and ev:WaitForChild("RhythmStop", 30)
+        if rs then
+            conns[#conns + 1] = rs.OnClientEvent:Connect(function()
+                st.on = true
+                st.count = 0
+                st.seen = setmetatable({}, { __mode = "k" })
+                pickMisses()
+            end)
+        end
+        if stop then
+            conns[#conns + 1] = stop.OnClientEvent:Connect(function() st.on = false end)
+        end
+    end)
+    conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+        if not (running and st.on and Config.AutoRhythm) then return end
+        local gui = lp:FindFirstChild("PlayerGui")
+        local main = gui and gui:FindFirstChild("MainGui")
+        local fishing = main and main:FindFirstChild("Fishing")
+        local rhythm = fishing and fishing:FindFirstChild("Rhythm")
+        if not rhythm then return end
+        if not rhythm.Visible then
+            if tick() - (st.lastSeen or 0) > 8 then st.on = false end    -- the game window is gone: game over
+            return
+        end
+        st.lastSeen = tick()
+        local now = tick()
+        for _, lane in ipairs(LANES) do
+            local fr = rhythm:FindFirstChild("Progression" .. lane)
+            if fr then
+                local bar = fr:FindFirstChild("BarFrame")
+                local line = bar and bar.Position.Y.Scale or 0.85
+                for _, note in ipairs(fr:GetChildren()) do
+                    if note.Name == "Note_FX" and note:IsA("GuiObject") then
+                        local s = st.seen[note]
+                        if not s then
+                            st.count = st.count + 1
+                            s = {
+                                skip = st.miss[st.count] == true or isTrap(note),
+                                -- hit a little before / after the line (fractions of the screen; 0.05 is about 60 ms)
+                                off = (math.random() < 0.06) and (0.01 + math.random() * 0.03) or (-0.13 + math.random() * 0.12),
+                                done = false,
+                            }
+                            st.seen[note] = s
+                        end
+                        if not s.skip and not s.done then
+                            local y = note.Position.Y.Scale
+                            if y >= line + s.off and now - (st.lastPress[lane] or 0) > 0.06 then
+                                s.done = true
+                                st.lastPress[lane] = now
+                                press(rhythm, lane)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end)()
 do
     ui.boss = infoCard({
         { "fight", "Fight" }, { "bhp", "Boss HP" }, { "myhp", "My HP" }, { "phase", "Phase" },
@@ -2946,7 +3069,36 @@ end
 -- Data[UserId].TicketQuestCooldown (server time).
 setPage("Quest")
 ;(function()
-    local qs = { status = "Idle", dlg = nil, dlgAt = 0, shop = nil, busy = false, lastTalk = 0, boatNote = "" }
+    -- trace of what the quest automation did: console + file PPINGYYY_QuestLog.txt (send that file when something goes wrong)
+    local qBuf, qT0, qLastWrite, qDirty = {}, tick(), 0, false
+    local function qlog(msg)
+        msg = string.format("[%7.1f] %s", tick() - qT0, tostring(msg))
+        print("[PPINGYYY quest] " .. msg)
+        qBuf[#qBuf + 1] = msg
+        if #qBuf > 400 then table.remove(qBuf, 1) end
+        qDirty = true
+    end
+    local function qflush(force)
+        if not qDirty or not writefile then return end
+        if not force and tick() - qLastWrite < 3 then return end
+        qLastWrite, qDirty = tick(), false
+        pcall(writefile, "PPINGYYY_QuestLog.txt", table.concat(qBuf, "\n"))
+    end
+    task.spawn(function()
+        while running do
+            task.wait(3)
+            qflush(false)
+        end
+    end)
+    local qsData = { status = "Idle", dlg = nil, dlgAt = 0, shop = nil, busy = false, lastTalk = 0, boatNote = "" }
+    -- every assignment to qs.status is logged (the proxy is empty, so all writes go through __newindex)
+    local qs = setmetatable({}, {
+        __index = qsData,
+        __newindex = function(_, k, v)
+            if k == "status" and v ~= qsData.status then qlog("status: " .. tostring(v)) end
+            qsData[k] = v
+        end,
+    })
     local TICKET_NPC = "Ticket Quest Giver"
     local QUEST_NAMES = { "Hard Ticket Quest", "Easy Ticket Quest" }
     -- boat waypoints (x, z), taken from the positions logged while sailing by hand
@@ -2967,6 +3119,7 @@ setPage("Quest")
     end
     local function tp(pos, look)
         local r = myRoot()
+        qlog(string.format("TELEPORT to (%d,%d,%d)", pos.X, pos.Y, pos.Z))
         if r then
             pcall(function() r.AssemblyLinearVelocity = Vector3.zero end)
             local at = pos + Vector3.new(0, 3, 0)
@@ -2991,6 +3144,10 @@ setPage("Quest")
     local function respot(keep)
         if not hm then return end
         pcall(function() if keep then hm.setSpotHere() else hm.resetSpot() end end)
+    end
+    -- human-like pause between UI clicks (dialogue options, shop)
+    local function uiPause(mult)
+        task.wait((Config.QuestDelay or 1.2) * (mult or 1) * (0.8 + math.random() * 0.5))
     end
     -- in the water? (the game sets the Swimming attribute; the humanoid state is the backup)
     local function swimming()
@@ -3038,6 +3195,155 @@ setPage("Quest")
         return true
     end
     -- get off the boat: the game's own way is the BoatExitSeat remote (it fires on Jump); retry until we are free
+    -- sea route planner ---------------------------------------------------------------------------------------------
+    -- A* over a 50-stud grid of open water. free(x, z) says whether a cell is open sea, clear(ax, az, bx, bz) whether a
+    -- straight line is, both come from raycasts. Returns { {x, z}, ... } (start .. goal) or nil.
+    local function seaAStar(free, clear, ax, az, bx, bz)
+        local CELL = 50
+        local x0, z0 = math.min(ax, bx) - 450, math.min(az, bz) - 450
+        local W = math.ceil((math.abs(ax - bx) + 900) / CELL)
+        local H = math.ceil((math.abs(az - bz) + 900) / CELL)
+        local function cellOf(x, z)
+            return math.clamp(math.floor((x - x0) / CELL), 0, W - 1), math.clamp(math.floor((z - z0) / CELL), 0, H - 1)
+        end
+        local function centre(i, j) return x0 + (i + 0.5) * CELL, z0 + (j + 0.5) * CELL end
+        local si, sj = cellOf(ax, az)
+        local gi, gj = cellOf(bx, bz)
+        local cache = {}
+        local function ok(i, j)
+            if i < 0 or j < 0 or i >= W or j >= H then return false end
+            if (i == si and j == sj) or (i == gi and j == gj) then return true end
+            local k = i + j * W
+            local v = cache[k]
+            if v == nil then
+                local cx, cz = centre(i, j)
+                v = free(cx, cz) and true or false
+                cache[k] = v
+            end
+            return v
+        end
+        local sk, gk = si + sj * W, gi + gj * W
+        local g, from, closed, open = { [sk] = 0 }, {}, {}, { sk }
+        local function hcost(k)
+            local i, j = k % W, math.floor(k / W)
+            return math.sqrt((i - gi) ^ 2 + (j - gj) ^ 2)
+        end
+        local steps = 0
+        local found = false
+        while #open > 0 and steps < 6000 do
+            steps = steps + 1
+            local bi, bf = 1, math.huge
+            for n = 1, #open do
+                local f = g[open[n]] + hcost(open[n])
+                if f < bf then bi, bf = n, f end
+            end
+            local k = open[bi]
+            open[bi] = open[#open]
+            open[#open] = nil
+            if not closed[k] then
+                closed[k] = true
+                if k == gk then found = true; break end
+                local i, j = k % W, math.floor(k / W)
+                for di = -1, 1 do
+                    for dj = -1, 1 do
+                        if di ~= 0 or dj ~= 0 then
+                            local ni, nj = i + di, j + dj
+                            local diag = (di ~= 0 and dj ~= 0)
+                            if ok(ni, nj) and (not diag or (ok(i + di, j) and ok(i, j + dj))) then
+                                local nk = ni + nj * W
+                                local ng = g[k] + (diag and 1.414 or 1)
+                                if not closed[nk] and (g[nk] == nil or ng < g[nk]) then
+                                    g[nk] = ng
+                                    from[nk] = k
+                                    open[#open + 1] = nk
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if not found then return nil end
+        local cells, k = {}, gk
+        while k do
+            table.insert(cells, 1, k)
+            k = from[k]
+        end
+        local pts = {}
+        for n, key in ipairs(cells) do
+            local i, j = key % W, math.floor(key / W)
+            local cx, cz = centre(i, j)
+            pts[n] = { cx, cz }
+        end
+        pts[1] = { ax, az }
+        pts[#pts] = { bx, bz }
+        -- string pulling: skip every point we can reach in a straight clear line
+        local out, a = { pts[1] }, 1
+        while a < #pts do
+            local b = #pts
+            while b > a + 1 and not clear(pts[a][1], pts[a][2], pts[b][1], pts[b][2]) do b = b - 1 end
+            out[#out + 1] = pts[b]
+            a = b
+        end
+        return out
+    end
+
+    -- is the water around (x, z) open? (raycast from high above: terrain water / anything at sea level = open sea)
+    local seaParams = nil
+    local function seaLevel()
+        local v = 0
+        pcall(function() v = tonumber(RS.SeaLevel.Value) or 0 end)
+        return v
+    end
+    local function isWater(x, z)
+        if not seaParams then
+            seaParams = RaycastParams.new()
+            seaParams.FilterType = Enum.RaycastFilterType.Exclude
+            seaParams.IgnoreWater = false
+        end
+        local skip = { lp.Character }
+        local boats = Workspace:FindFirstChild("Boat")
+        if boats then skip[#skip + 1] = boats end
+        seaParams.FilterDescendantsInstances = skip
+        local lvl = seaLevel()
+        local hit = Workspace:Raycast(Vector3.new(x, lvl + 150, z), Vector3.new(0, -400, 0), seaParams)
+        if not hit then return true end                 -- nothing loaded there: assume open sea
+        return hit.Material == Enum.Material.Water or hit.Position.Y <= lvl + 1.5
+    end
+    local planCalls = 0
+    local function seaFree(x, z)
+        planCalls = planCalls + 1
+        if planCalls % 120 == 0 then task.wait() end
+        return isWater(x, z) and isWater(x + 30, z) and isWater(x - 30, z) and isWater(x, z + 30) and isWater(x, z - 30)
+    end
+    local function seaClear(ax, az, bx, bz)
+        local d = math.sqrt((bx - ax) ^ 2 + (bz - az) ^ 2)
+        local n = math.max(1, math.ceil(d / 25))
+        local nx, nz = -(bz - az) / math.max(d, 1), (bx - ax) / math.max(d, 1)
+        for i = 0, n do
+            local x, z = ax + (bx - ax) * i / n, az + (bz - az) * i / n
+            if not (isWater(x, z) and isWater(x + nx * 18, z + nz * 18) and isWater(x - nx * 18, z - nz * 18)) then return false end
+        end
+        return true
+    end
+    -- keep the known-good hand-made route when nothing is in the way, else plan a way around the land
+    local function chooseRoute(startPos, static)
+        local pts = { Vector2.new(startPos.X, startPos.Z) }
+        for _, q in ipairs(static) do pts[#pts + 1] = q end
+        local clearAll = true
+        for i = 1, #pts - 1 do
+            if not seaClear(pts[i].X, pts[i].Y, pts[i + 1].X, pts[i + 1].Y) then clearAll = false; break end
+        end
+        if clearAll then return static, "static route clear" end
+        local goal = static[#static]
+        planCalls = 0
+        local planned = seaAStar(seaFree, seaClear, startPos.X, startPos.Z, goal.X, goal.Y)
+        if not planned then return static, "no sea route found - using the fixed route" end
+        local out = {}
+        for i = 2, #planned do out[#out + 1] = Vector2.new(planned[i][1], planned[i][2]) end
+        return out, "planned " .. #out .. " waypoints around the land"
+    end
+
     -- the boat shop window stays open after Spawn (it covers the screen) -> close it like the X button does
     local function closeShop()
         pcall(function()
@@ -3084,7 +3390,7 @@ setPage("Quest")
         params.FilterType = Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances = { lp.Character }
         local feet = r.Position.Y - (h.HipHeight + r.Size.Y / 2)
-        for _, hgt in ipairs({ 0.6, 1.8, 3.0, 4.2, 5.4, 6.6 }) do
+        for _, hgt in ipairs({ 0.6, 1.8, 3.0, 4.2, 5.4, 6.6, 7.8, 9.0 }) do
             local hit = Workspace:Raycast(Vector3.new(r.Position.X, feet + hgt, r.Position.Z), d * 3.5, params)
             if not hit then return hgt end            -- free here: the obstacle is lower than this probe
         end
@@ -3114,9 +3420,26 @@ setPage("Quest")
         end
         return dist(pos) < 12
     end
+    -- a higher jump while we walk (default jump cannot clear kerbs / crates); restored afterwards
+    local jumpSaved = nil
+    local function jumpBoost(on)
+        local h = myHum()
+        if not h then jumpSaved = nil; return end
+        if on then
+            if jumpSaved then return end
+            jumpSaved = { jp = h.JumpPower, jh = h.JumpHeight }
+            if h.UseJumpPower then h.JumpPower = math.max(h.JumpPower, 72) else h.JumpHeight = math.max(h.JumpHeight, 12) end
+        elseif jumpSaved then
+            if h.UseJumpPower then h.JumpPower = jumpSaved.jp else h.JumpHeight = jumpSaved.jh end
+            jumpSaved = nil
+        end
+    end
     local function walkTo(pos, timeout)
         local h = myHum()
         if not h then return false end
+        pcall(jumpBoost, true)
+        -- far away: follow a path from the start (goes around things) instead of bumping into them
+        if dist(pos) > 30 then pcall(pathTo, pos, math.min(timeout * 0.7, 45)) end
         local t0, lastMove = tick(), 0
         local lastPos, lastAt, stuck = nil, tick(), 0
         while tick() - t0 < timeout and running do
@@ -3131,7 +3454,7 @@ setPage("Quest")
                     if (r.Position - lastPos).Magnitude < 1.2 and dist(pos) > 10 then
                         stuck = stuck + 1
                         local oh = obstacleHeight(pos)
-                        if stuck == 1 and oh and oh <= 6.6 then
+                        if stuck == 1 and oh and oh <= 9.0 then
                             pcall(function() h.Jump = true end)               -- one normal jump onto the step
                         elseif stuck <= 3 then
                             if not pathTo(pos, 15) then
@@ -3156,6 +3479,12 @@ setPage("Quest")
             task.wait(0.2)
         end
         return dist(pos) < 14
+    end
+    local walkToInner = walkTo
+    walkTo = function(pos, timeout)
+        local ok, res = pcall(walkToInner, pos, timeout)
+        pcall(jumpBoost, false)
+        return ok and res or false
     end
 
     -- bait: "Use bait N times" quests need a bait equipped; pick the one the player chose (or the cheapest owned) ---
@@ -3280,6 +3609,7 @@ setPage("Quest")
         if not waitFor(function() return qs.dlgAt > t0 and qs.dlg and qs.dlg.npc == npcName end, 4) then
             return false, "no dialogue opened (too far away?)"
         end
+        uiPause(1.3)                                   -- read the dialogue before clicking
         local ev = RS:FindFirstChild("Events") and RS.Events:FindFirstChild("ChooseDialogueOption")
         if not ev then return false, "ChooseDialogueOption missing" end
         for _ = 1, maxSteps or 4 do
@@ -3287,6 +3617,7 @@ setPage("Quest")
             local idx, typ = chooser(d.opts)
             if not idx then return true, "dialogue finished" end
             local before = qs.dlgAt
+            uiPause()
             pcall(function() ev:FireServer(npcName, idx, typ, d.args) end)
             if typ == "BoatShop" then return true, "boat shop" end
             if not waitFor(function() return qs.dlgAt > before end, 3) then return true, "no follow-up" end
@@ -3326,6 +3657,7 @@ setPage("Quest")
         local spawnR = (shopF and shopF:FindFirstChild("Spawn")) or (Events and Events:FindFirstChild("Spawn"))
         if not spawnR then return false, "Spawn remote missing" end
         local loc = qs.shop.loc
+        uiPause()
         pcall(function() spawnR:FireServer(Config.BoatName, loc) end)
         task.delay(1.2, closeShop)
         local boat = nil
@@ -3360,11 +3692,39 @@ setPage("Quest")
         local ms = cfg and cfg:FindFirstChild("MaxSpeed")
         local speed = ((ms and ms.Value) or 60) * 0.95
         local wp, state = 1, nil
+        do
+            qs.boatNote = "planning the route"
+            local okR, newRoute, note = pcall(chooseRoute, seat.Position, route)
+            if okR and newRoute and #newRoute > 0 then route = newRoute end
+            qlog("boat route: " .. tostring(okR and note or newRoute) .. "  (start " .. string.format("%d,%d,%d", seat.Position.X, seat.Position.Y, seat.Position.Z) .. ", " .. #route .. " waypoints)")
+            qs.boatNote = ""
+        end
         local conn
+        local unseatAt, resit = nil, 0
         -- the game's own boat script rewrites BodyVelocity / AlignOrientation every Heartbeat from the (zero) throttle,
         -- which cancelled ours. PreSimulation runs right BEFORE physics, i.e. after theirs, so our values are the ones used.
         conn = (RunService.PreSimulation or RunService.Stepped):Connect(function()
-            if not running or not seat.Parent or h.SeatPart ~= seat then state = state or "left the boat"; conn:Disconnect(); return end
+            if not running or not seat.Parent then state = state or "left the boat"; conn:Disconnect(); return end
+            if h.SeatPart ~= seat then
+                -- thrown out (bump / respawn glitch)? log why, then try to sit back down up to 3 times before giving up
+                local now = os.clock()
+                if not unseatAt then
+                    unseatAt = now
+                    resit = resit + 1
+                    local hs = ""
+                    pcall(function() hs = tostring(h:GetState()) .. " hp=" .. math.floor(h.Health) .. " occ=" .. tostring(seat.Occupant) .. " v=" .. math.floor(seat.AssemblyLinearVelocity.Magnitude) end)
+                    qlog("unseated at waypoint " .. wp .. " (" .. hs .. ") resit#" .. resit)
+                end
+                if now - unseatAt > 0.4 then
+                    if resit > 3 then state = state or "left the boat"; resit = nil; unseatAt = nil; conn:Disconnect(); return end
+                    local r = myRoot()
+                    if r then r.CFrame = seat.CFrame * CFrame.new(0, 2, 0) end
+                    pcall(function() seat:Sit(h) end)
+                    unseatAt = nil
+                end
+                return
+            end
+            unseatAt = nil
             local p, target = seat.Position, route[wp]
             local d = Vector3.new(target.X - p.X, 0, target.Y - p.Z)
             if d.Magnitude < 70 then
@@ -3414,7 +3774,8 @@ setPage("Quest")
                 lastP, lastT = seat.Position, tick()
             end
         end
-        print("[PPINGYYY boat] trip ended: " .. tostring(state or (running and "timeout" or "stopped")))
+        qlog("boat trip ended: " .. tostring(state or (running and "timeout" or "stopped")) .. "  waypoint " .. wp .. "/" .. #route)
+        qflush(true)
         pcall(function() RunService:UnbindFromRenderStep("PPY_BoatThrottle") end)
         pcall(function() seat.ThrottleFloat = 0; seat.SteerFloat = 0 end)
         pcall(function() conn:Disconnect() end)
@@ -3572,6 +3933,7 @@ setPage("Quest")
             baitBtn.Text = baitText()
         end)
     end
+    makeSlider("Dialogue click delay", "s", 0.5, 3, 0.1, 0.1, 1, Config.QuestDelay, function(v) Config.QuestDelay = v end)
     actionButton("Save this position as farm spot", 30, function()
         play(clickSound)
         local r = myRoot()
