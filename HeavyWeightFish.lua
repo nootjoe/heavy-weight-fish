@@ -3152,12 +3152,14 @@ setPage("Quest")
     -- in the water? (the game sets the Swimming attribute; the humanoid state is the backup)
     local function swimming()
         local c, h = lp.Character, myHum()
+        if qs.sailing then return false end
         if c and c:GetAttribute("Swimming") == true then return true end
         return h ~= nil and h:GetState() == Enum.HumanoidStateType.Swimming
     end
     -- climb out: look for dry ground around us (nearest ring first, the spot closest to `toward` wins), swim + jump
     -- towards it, and hop onto it if the water will not let go after a few seconds
     local function rescueWater(toward)
+        if qs.sailing then return false end      -- a jump while seated fires the game's BoatExitSeat: never while on the boat
         local r, h = myRoot(), myHum()
         if not (r and h) then return false end
         local params = RaycastParams.new()
@@ -3760,6 +3762,13 @@ setPage("Quest")
         local ms = cfg and cfg:FindFirstChild("MaxSpeed")
         local speed = ((ms and ms.Value) or 60) * 0.95
         local wp, state = 1, nil
+        qs.sailing = true
+        local jumpConn
+        pcall(function()
+            jumpConn = game:GetService("UserInputService").JumpRequest:Connect(function()
+                qlog("JumpRequest while on the boat (something made the character jump)")
+            end)
+        end)
         do
             qs.boatNote = "planning the route"
             local okR, newRoute, note = pcall(chooseRoute, seat.Position, route)
@@ -3772,7 +3781,10 @@ setPage("Quest")
         -- the game's own boat script rewrites BodyVelocity / AlignOrientation every Heartbeat from the (zero) throttle,
         -- which cancelled ours. PreSimulation runs right BEFORE physics, i.e. after theirs, so our values are the ones used.
         conn = (RunService.PreSimulation or RunService.Stepped):Connect(function()
-            if not running or not seat.Parent then state = state or "left the boat"; conn:Disconnect(); return end
+            if not running or not seat.Parent then
+                if running then qlog("boat object was removed (seat.Parent = nil) at waypoint " .. wp .. "; boat parent: " .. tostring(boat.Parent)) end
+                state = state or "left the boat"; conn:Disconnect(); return
+            end
             if h.SeatPart ~= seat then
                 -- thrown out (bump / respawn glitch)? log why, then try to sit back down up to 3 times before giving up
                 local now = os.clock()
@@ -3869,7 +3881,9 @@ setPage("Quest")
                 lastP, lastT = seat.Position, tick()
             end
         end
-        qlog("boat trip ended: " .. tostring(state or (running and "timeout" or "stopped")) .. "  waypoint " .. wp .. "/" .. #route)
+        qs.sailing = false
+        pcall(function() if jumpConn then jumpConn:Disconnect() end end)
+                qlog("boat trip ended: " .. tostring(state or (running and "timeout" or "stopped")) .. "  waypoint " .. wp .. "/" .. #route)
         qflush(true)
         pcall(function() RunService:UnbindFromRenderStep("PPY_BoatThrottle") end)
         pcall(function() seat.ThrottleFloat = 0; seat.SteerFloat = 0 end)
@@ -3991,6 +4005,7 @@ setPage("Quest")
         task.spawn(function()
             local ok, err = pcall(fn)
             if not ok then qs.status = "error: " .. tostring(err) end
+            qs.sailing = false
             ui.questBusy = false
             qs.busy = false
         end)
