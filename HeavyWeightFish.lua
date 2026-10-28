@@ -76,7 +76,7 @@ local Config = {
     QuestBait = "Auto",       -- bait to equip for "use bait" quests: "Off", "Auto" (cheapest you own) or a bait name
     QuestFarmPos = { 1362, 9, 268 },   -- Battlefield fishing spot (cast position seen in the log: 1362.21, 9.28, 267.87)
     QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
-    BoatName = "White Heaven Kunfish", -- the boat you own / use at the boat NPC
+    BoatName = "Auto", -- "Auto" = the fastest boat you own; or type an exact boat name
     BlackFps = 20,            -- FPS cap used automatically while the black screen is on
     BlackHideUi = true,       -- black screen also switches the game's own UI + Roblox core UI off (less to draw)
     BlackHud = false,         -- show the small money/status text on the black screen (false = completely black)
@@ -3198,7 +3198,7 @@ setPage("Quest")
     -- sea route planner ---------------------------------------------------------------------------------------------
     -- A* over a 50-stud grid of open water. free(x, z) says whether a cell is open sea, clear(ax, az, bx, bz) whether a
     -- straight line is, both come from raycasts. Returns { {x, z}, ... } (start .. goal) or nil.
-    local function seaAStar(free, clear, ax, az, bx, bz)
+    local function seaAStar(free, clear, ax, az, bx, bz, weak)
         local CELL = 50
         local x0, z0 = math.min(ax, bx) - 450, math.min(az, bz) - 450
         local W = math.ceil((math.abs(ax - bx) + 900) / CELL)
@@ -3214,6 +3214,11 @@ setPage("Quest")
             if i < 0 or j < 0 or i >= W or j >= H then return false end
             if (i == si and j == sj) or (i == gi and j == gj) then return true end
             local k = i + j * W
+            -- shore side: the start / goal sit right next to land, so near them a single water check is enough
+            if weak and (math.abs(i - si) + math.abs(j - sj) <= 3 or math.abs(i - gi) + math.abs(j - gj) <= 3) then
+                local cx, cz = centre(i, j)
+                return weak(cx, cz)
+            end
             local v = cache[k]
             if v == nil then
                 local cx, cz = centre(i, j)
@@ -3337,11 +3342,27 @@ setPage("Quest")
         if clearAll then return static, "static route clear" end
         local goal = static[#static]
         planCalls = 0
-        local planned = seaAStar(seaFree, seaClear, startPos.X, startPos.Z, goal.X, goal.Y)
+        local planned = seaAStar(seaFree, seaClear, startPos.X, startPos.Z, goal.X, goal.Y, isWater)
+        local note0 = ""
+        if not planned then
+            -- the goal itself may sit on / behind land: look for open water around it and plan to that instead
+            for _, r in ipairs({ 80, 160, 260, 380 }) do
+                for k = 0, 11 do
+                    local ang = k * math.pi / 6
+                    local gx, gz = goal.X + math.cos(ang) * r, goal.Y + math.sin(ang) * r
+                    if seaFree(gx, gz) then
+                        planCalls = 0
+                        planned = seaAStar(seaFree, seaClear, startPos.X, startPos.Z, gx, gz, isWater)
+                        if planned then note0 = " (goal moved " .. r .. " studs to open water)"; break end
+                    end
+                end
+                if planned then break end
+            end
+        end
         if not planned then return static, "no sea route found - using the fixed route" end
         local out = {}
         for i = 2, #planned do out[#out + 1] = Vector2.new(planned[i][1], planned[i][2]) end
-        return out, "planned " .. #out .. " waypoints around the land"
+        return out, "planned " .. #out .. " waypoints around the land" .. note0
     end
 
     -- the boat shop window stays open after Spawn (it covers the screen) -> close it like the X button does
@@ -3604,11 +3625,34 @@ setPage("Quest")
         end
         if not prompt then return false, "NPC has no ProximityPrompt" end
         if not fireproximityprompt then return false, "executor has no fireproximityprompt" end
-        local t0 = qs.dlgAt
-        pcall(fireproximityprompt, prompt)
-        if not waitFor(function() return qs.dlgAt > t0 and qs.dlg and qs.dlg.npc == npcName end, 4) then
-            return false, "no dialogue opened (too far away?)"
+        pcall(function() prompt.RequiresLineOfSight = false end)
+        local function promptPos()
+            local par, p = prompt.Parent, nil
+            pcall(function()
+                if par:IsA("BasePart") then p = par.Position elseif par:IsA("Attachment") then p = par.WorldPosition end
+            end)
+            return p or (model:IsA("Model") and model:GetPivot().Position) or nil
         end
+        local opened = false
+        for attempt = 1, 3 do
+            -- get inside the prompt's own activation distance first (the NPC position used by the caller can be several studs off)
+            local pp = promptPos()
+            local mad = 10
+            pcall(function() mad = prompt.MaxActivationDistance end)
+            if pp and dist(pp) > math.max(3, mad - 3) then
+                local r = myRoot()
+                local away = r and Vector3.new(r.Position.X - pp.X, 0, r.Position.Z - pp.Z) or Vector3.new(1, 0, 0)
+                away = (away.Magnitude > 0.1) and away.Unit or Vector3.new(1, 0, 0)
+                local near = pp + away * 3
+                if attempt == 1 then walkTo(near, 20) end
+                if dist(pp) > math.max(3, mad - 3) then tp(near); task.wait(0.8) end
+            end
+            local t0 = qs.dlgAt
+            pcall(fireproximityprompt, prompt)
+            if waitFor(function() return qs.dlgAt > t0 and qs.dlg and qs.dlg.npc == npcName end, 4) then opened = true; break end
+            qlog("talk attempt " .. attempt .. " failed (dist " .. string.format("%.1f", pp and dist(pp) or -1) .. ", range " .. tostring(mad) .. ")")
+        end
+        if not opened then return false, "no dialogue opened (too far away?)" end
         uiPause(1.3)                                   -- read the dialogue before clicking
         local ev = RS:FindFirstChild("Events") and RS.Events:FindFirstChild("ChooseDialogueOption")
         if not ev then return false, "ChooseDialogueOption missing" end
@@ -3658,7 +3702,27 @@ setPage("Quest")
         if not spawnR then return false, "Spawn remote missing" end
         local loc = qs.shop.loc
         uiPause()
-        pcall(function() spawnR:FireServer(Config.BoatName, loc) end)
+        local boatName = Config.BoatName
+        if boatName == nil or boatName == "" or boatName == "Auto" or boatName == "White Heaven Kunfish" then   -- the old saved default counts as Auto
+            local best, bestSpeed = nil, -1
+            pcall(function()
+                local data = getData()
+                local owned = data and data:FindFirstChild("Boats")
+                local info = RS:FindFirstChild("Info") and RS.Info:FindFirstChild("Boats")
+                if not (owned and info) then return end
+                for _, v in ipairs(owned:GetChildren()) do
+                    if v.Value == true and info:FindFirstChild(v.Name) then
+                        local m = require(info[v.Name])
+                        local sp = tonumber(tostring(m.Description or ""):match("(%d+)%s*[Ss]peed")) or 0
+                        if sp > bestSpeed then best, bestSpeed = v.Name, sp end
+                    end
+                end
+            end)
+            boatName = best or "Boat"
+            qlog("boat: using " .. boatName .. " (" .. bestSpeed .. " speed)")
+        end
+        Config.BoatNameUsed = boatName
+        pcall(function() spawnR:FireServer(boatName, loc) end)
         task.delay(1.2, closeShop)
         local boat = nil
         if not waitFor(function()
@@ -3666,12 +3730,16 @@ setPage("Quest")
             local lF = bF and bF:FindFirstChild(tostring(loc))
             boat = lF and lF:FindFirstChild("Boat_" .. lp.UserId)
             return boat ~= nil and boat:FindFirstChild("VehicleSeat") ~= nil and boat:FindFirstChild("Root") ~= nil
-        end, 12) then return false, "boat did not appear (is '" .. tostring(Config.BoatName) .. "' your boat?)" end
+        end, 12) then return false, "boat did not appear (is '" .. tostring(Config.BoatNameUsed) .. "' your boat?)" end
         local seat, h = boat.VehicleSeat, myHum()
         if not h then return false, "no humanoid" end
         task.wait(1.0)   -- the boat drops onto the water first: let it settle before sitting
         local seated = false
-        for _ = 1, 4 do
+        for try = 1, 7 do
+            if try > 1 then
+                qlog("sit attempt " .. try .. " (seat y " .. string.format("%.1f", seat.Position.Y) .. ", state " .. tostring(h:GetState()) .. ")")
+                task.wait(0.6 * try)   -- big boats (Omega) take longer to settle on the water
+            end
             local r = myRoot()
             if r then
                 pcall(function() r.AssemblyLinearVelocity = Vector3.zero end)
@@ -3700,7 +3768,7 @@ setPage("Quest")
             qs.boatNote = ""
         end
         local conn
-        local unseatAt, resit = nil, 0
+        local unseatAt, resit, backing = nil, 0, false
         -- the game's own boat script rewrites BodyVelocity / AlignOrientation every Heartbeat from the (zero) throttle,
         -- which cancelled ours. PreSimulation runs right BEFORE physics, i.e. after theirs, so our values are the ones used.
         conn = (RunService.PreSimulation or RunService.Stepped):Connect(function()
@@ -3748,13 +3816,26 @@ setPage("Quest")
                     -- the game turns RIGHT for a positive steer (yaw -= steer * ...), so steer = -err
                     local steer = math.clamp(-err * 1.6, -1, 1)
                     if math.abs(err) < 0.04 then steer = 0 end
+                    -- whiskers: land 70 studs ahead on one side -> lean away; land dead ahead -> slow down
+                    local fl = Vector3.new(look.X, 0, look.Z).Unit
+                    local function probe(a, dist)
+                        local c, sn = math.cos(a), math.sin(a)
+                        local dx, dz = fl.X * c - fl.Z * sn, fl.X * sn + fl.Z * c
+                        return isWater(p.X + dx * dist, p.Z + dz * dist)
+                    end
+                    local slow = false
+                    if not probe(0, 90) then slow = true end
+                    local wr, wl = probe(0.5, 70), probe(-0.5, 70)   -- +0.5 rad turns toward +X = right when facing -Z
+                    if not wl and wr then steer = math.max(steer, 0.7) elseif not wr and wl then steer = math.min(steer, -0.7) elseif not wl and not wr then slow = true end
                     seat.SteerFloat = steer
-                    seat.ThrottleFloat = (math.abs(err) > 1.0) and 0.5 or 1
+                    seat.ThrottleFloat = (slow or math.abs(err) > 1.0) and 0.5 or 1
+                    if backing then seat.SteerFloat = 0; seat.ThrottleFloat = -1 end
                 end)
             end)
         end)
         local t0, lastP, lastT = tick(), seat.Position, tick()
         local firstCheck = true
+        local replans = 0
         while state == nil and running and tick() - t0 < 300 do
             task.wait(1)
             local sp = (seat.Position - lastP).Magnitude / math.max(0.1, tick() - lastT)
@@ -3769,7 +3850,21 @@ setPage("Quest")
                     bv.Velocity.Magnitude, tostring(root.Anchored), tostring(pcall(function() return root:GetNetworkOwner() end))))
             end
             if tick() - lastT >= (firstCheck and 12 or 8) then
-                if (seat.Position - lastP).Magnitude < 12 then state = "stuck (boat not moving)" end
+                if (seat.Position - lastP).Magnitude < 12 then
+                    if replans < 2 then
+                        -- aground / blocked: reverse a moment, then plan a new way from where we are
+                        replans = replans + 1
+                        qlog("boat stuck at " .. string.format("%d,%d,%d", seat.Position.X, seat.Position.Y, seat.Position.Z) .. " -> backing off + replanning #" .. replans)
+                        backing = true
+                        task.wait(2.5)
+                        backing = false
+                        local okR, newRoute, note = pcall(chooseRoute, seat.Position, { route[#route] })
+                        if okR and newRoute and #newRoute > 0 then route = newRoute; wp = 1 end
+                        qlog("replan: " .. tostring(okR and note or newRoute) .. " (" .. #route .. " waypoints)")
+                    else
+                        state = "stuck (boat not moving)"
+                    end
+                end
                 firstCheck = false
                 lastP, lastT = seat.Position, tick()
             end
