@@ -81,6 +81,10 @@ local Config = {
     QuestBait = "Auto",       -- bait to equip for "use bait" quests: "Off", "Auto" (cheapest you own) or a bait name
     QuestFarmPos = { 1362, 9, 268 },   -- Battlefield fishing spot (cast position seen in the log: 1362.21, 9.28, 267.87)
     QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
+    QuestFarmPosEasy = nil,            -- second spot (easy / quick island) for "use N bait / skill" quests; nil = not set
+    QuestFarmLookEasy = nil,
+    EasyMinAmount = 30,                -- a plain "do it N times" quest with N at or above this goes to the easy spot
+    QuestSplitFarm = true,             -- use the easy spot for the big, simple "use ..." quests (when it is set)
     BoatName = "Auto", -- "Auto" = the fastest boat you own; or type an exact boat name
     BlackFps = 20,            -- FPS cap used automatically while the black screen is on
     BlackHideUi = true,       -- black screen also switches the game's own UI + Roblox core UI off (less to draw)
@@ -486,6 +490,8 @@ local function saveSettings()
             LiveMsgId = live.id, LiveMsgUrl = Config.WebhookUrl, RhythmMethod = Config.RhythmMethod, TalkMethod = Config.TalkMethod,
             AutoBuyBait = Config.AutoBuyBait, BuyBaitName = Config.BuyBaitName, BuyBaitAmount = Config.BuyBaitAmount,
             BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel,
+            QuestFarmPos = Config.QuestFarmPos, QuestFarmLook = Config.QuestFarmLook, QuestFarmPosEasy = Config.QuestFarmPosEasy,
+            QuestFarmLookEasy = Config.QuestFarmLookEasy, QuestSplitFarm = Config.QuestSplitFarm, EasyMinAmount = Config.EasyMinAmount,
         }))
     end)
 end
@@ -512,6 +518,14 @@ local function loadSettings()
                 if type(data.BuyBaitAmount) == "number" then Config.BuyBaitAmount = math.clamp(math.floor(data.BuyBaitAmount), 1, 400) end
                 if type(data.BuyBaitBelow) == "number" then Config.BuyBaitBelow = math.clamp(math.floor(data.BuyBaitBelow), 0, 399) end
                 if data.BaitTravel == "Walk" or data.BaitTravel == "Teleport" then Config.BaitTravel = data.BaitTravel end
+                local function isPos(v) return type(v) == "table" and #v == 3 and type(v[1]) == "number" and type(v[2]) == "number" and type(v[3]) == "number" end
+                local function isLook(v) return type(v) == "table" and type(v[1]) == "number" and type(v[2]) == "number" end
+                if isPos(data.QuestFarmPos) then Config.QuestFarmPos = data.QuestFarmPos end
+                if isLook(data.QuestFarmLook) then Config.QuestFarmLook = data.QuestFarmLook end
+                if isPos(data.QuestFarmPosEasy) then Config.QuestFarmPosEasy = data.QuestFarmPosEasy end
+                if isLook(data.QuestFarmLookEasy) then Config.QuestFarmLookEasy = data.QuestFarmLookEasy end
+                if type(data.QuestSplitFarm) == "boolean" then Config.QuestSplitFarm = data.QuestSplitFarm end
+                if type(data.EasyMinAmount) == "number" then Config.EasyMinAmount = math.clamp(math.floor(data.EasyMinAmount), 1, 500) end
                 if type(data.WebhookLive) == "boolean" then Config.WebhookLive = data.WebhookLive end
                 if type(data.LiveInterval) == "number" then Config.LiveInterval = math.clamp(math.floor(data.LiveInterval), 10, 300) end
                 -- keep editing the same Discord message after a re-execute (only if it is still the same webhook)
@@ -3206,10 +3220,17 @@ setPage("Quest")
     local function myRoot() local c = lp.Character; return c and c:FindFirstChild("HumanoidRootPart") end
     local function myHum() local c = lp.Character; return c and c:FindFirstChildOfClass("Humanoid") end
     local function dist(pos) local r = myRoot(); return r and (r.Position - pos).Magnitude or math.huge end
-    local function farmPos() local p = Config.QuestFarmPos; return Vector3.new(p[1], p[2], p[3]) end
+    -- two fishing spots: "hard" (the original one, e.g. big fish) and "easy" (a quick island for the simple "use N bait /
+    -- skill" quests). qs.farmKind says which one the current quest wants; without an easy spot everything uses the hard one.
+    local function farmIsEasy() return qs.farmKind == "easy" and Config.QuestFarmPosEasy ~= nil end
+    local function farmPos()
+        local p = farmIsEasy() and Config.QuestFarmPosEasy or Config.QuestFarmPos
+        return Vector3.new(p[1], p[2], p[3])
+    end
+    local function farmLook() return farmIsEasy() and Config.QuestFarmLookEasy or Config.QuestFarmLook end
     local function waitFor(cond, timeout)
         local t0 = tick()
-        while tick() - t0 < timeout and running do
+        while tick() - t0 < timeout and running and not qs.cancel do
             if cond() then return true end
             task.wait(0.1)
         end
@@ -3233,7 +3254,8 @@ setPage("Quest")
         local r = myRoot()
         if not (r and hm and hm.seaLook) then return end
         pcall(function()
-            local pref = Config.QuestFarmLook and Vector3.new(Config.QuestFarmLook[1], 0, Config.QuestFarmLook[2]) or nil
+            local fl = farmLook()
+            local pref = fl and Vector3.new(fl[1], 0, fl[2]) or nil
             local look = hm.seaLook(r.Position, pref)
             if look then r.CFrame = CFrame.lookAt(r.Position, r.Position + look) end
         end)
@@ -3475,11 +3497,11 @@ setPage("Quest")
     end
 
     -- the boat shop window stays open after Spawn (it covers the screen) -> close it like the X button does
-    local function closeShop()
+    local function closeShop(name)
         pcall(function()
             local gui = lp:FindFirstChild("PlayerGui") and lp.PlayerGui:FindFirstChild("MainGui")
             local menu = gui and gui:FindFirstChild("Menu")
-            local shop = menu and menu:FindFirstChild("BoatShop")
+            local shop = menu and menu:FindFirstChild(name or "BoatShop")
             if not shop then return end
             local c = shop:FindFirstChild("Close")
             if c and firesignal then pcall(firesignal, c.MouseButton1Click) end
@@ -3659,13 +3681,19 @@ setPage("Quest")
     end
     -- a higher jump while we walk (default jump cannot clear kerbs / crates); restored afterwards
     local jumpSaved = nil
-    local function jumpBoost(on)
+    -- `want` = jump height in studs (default 8: clears a 5-6 stud crate; the old fixed boost was 13 = "jumps way too high").
+    -- It is only raised above that when an obstacle probe says the thing in front is taller (see walkTo), never above 11.
+    local function jumpBoost(on, want)
         local h = myHum()
         if not h then jumpSaved = nil; return end
         if on then
-            if jumpSaved then return end
-            jumpSaved = { jp = h.JumpPower, jh = h.JumpHeight }
-            if h.UseJumpPower then h.JumpPower = math.max(h.JumpPower, 72) else h.JumpHeight = math.max(h.JumpHeight, 12) end
+            want = math.clamp(want or 8, 7, 11)
+            if not jumpSaved then jumpSaved = { jp = h.JumpPower, jh = h.JumpHeight } end
+            if h.UseJumpPower then
+                h.JumpPower = math.max(jumpSaved.jp, math.sqrt(2 * 196.2 * want))
+            else
+                h.JumpHeight = math.max(jumpSaved.jh, want)
+            end
         elseif jumpSaved then
             if h.UseJumpPower then h.JumpPower = jumpSaved.jp else h.JumpHeight = jumpSaved.jh end
             jumpSaved = nil
@@ -3682,7 +3710,7 @@ setPage("Quest")
         end
         local t0, lastMove, lastAvoid, wasAvoiding = tick(), 0, 0, false
         local lastPos, lastAt, stuck = nil, tick(), 0
-        while tick() - t0 < timeout and running do
+        while tick() - t0 < timeout and running and not qs.cancel do
             if dist(pos) < 8 then return true end
             if swimming() then rescueWater(pos) end
             if tick() - lastAvoid > 0.4 then
@@ -3710,6 +3738,7 @@ setPage("Quest")
                         stuck = stuck + 1
                         local oh = obstacleHeight(pos)
                         if stuck == 1 and oh and oh <= 9.0 then
+                            pcall(jumpBoost, true, oh + 2)                     -- just high enough for this obstacle (+2 studs)
                             pcall(function() h.Jump = true end)               -- one normal jump onto the step
                         elseif stuck <= 3 then
                             if not pathTo(pos, 15, ({ 2, 1.5, 1 })[stuck] or 1) then
@@ -4056,7 +4085,7 @@ setPage("Quest")
             qs.boatNote = ""
         end
         local conn
-        local unseatAt, resit, backing = nil, 0, false
+        local unseatAt, resit, backing, braking = nil, 0, false, false
         -- diagnostics for "the boat object was removed": the waypoints, where / how fast the boat was at the last frame,
         -- how long the trip had run, and whether the game's AFK flag changed in the meantime
         local tSail, lastPos, lastVel = tick(), seat.Position, 0
@@ -4134,18 +4163,60 @@ setPage("Quest")
                     if not wl and wr then steer = math.max(steer, 0.7) elseif not wr and wl then steer = math.min(steer, -0.7) elseif not wl and not wr then slow = true end
                     seat.SteerFloat = steer
                     seat.ThrottleFloat = (slow or math.abs(err) > 1.0) and 0.5 or 1
+                    -- speed governor: a boat doing 125 cannot make a 90 degree turn between waypoints 50 studs apart (it swings
+                    -- wide into the coast, steer flips +-1 every second). Near the end of the route and before sharp turns the
+                    -- throttle is driven by the MEASURED speed (does not depend on partial throttle being supported).
+                    -- vel = speed ALONG the bow (signed): a boat that has stopped and starts rolling backwards must never be
+                    -- braked again (the magnitude alone made it reverse for good)
+                    local vel = 0
+                    pcall(function() vel = seat.AssemblyLinearVelocity:Dot(look) end)
+                    local dw = math.sqrt((target.X - p.X) ^ 2 + (target.Y - p.Z) ^ 2)
+                    local cap = nil
+                    if wp >= #route - 1 and dw < 220 then cap = 60 end                    -- the last two waypoints sit next to the shore
+                    if dw < 170 and math.abs(err) > 0.5 then cap = math.min(cap or 999, 70) end
+                    if wp >= #route and dw < 110 then cap = 40 end
+                    if cap then
+                        if vel > cap * 1.6 then seat.ThrottleFloat = -0.5      -- short reverse thrust brakes (only while still going fast forward)
+                        elseif vel > cap then seat.ThrottleFloat = 0            -- coast
+                        else seat.ThrottleFloat = 1 end
+                    end
                     if backing then seat.SteerFloat = 0; seat.ThrottleFloat = -1 end
+                    if braking then seat.SteerFloat = 0; seat.ThrottleFloat = (vel > 15) and -0.6 or 0 end
                 end)
             end)
         end)
         local t0, lastP, lastT = tick(), seat.Position, tick()
+        local slowSecs = 0
         local firstCheck = true
         local replans = 0
         while state == nil and running and tick() - t0 < 300 do
             task.wait(1)
+            if qs.cancel then state = "cancelled"; break end
             local sp = (seat.Position - lastP).Magnitude / math.max(0.1, tick() - lastT)
             qs.boatNote = string.format("sailing %d/%d  %.0f studs/s", wp, #route, sp)
             lastPos, lastVel = seat.Position, sp
+            -- aground near the destination (the boat stops moving at the shore): that IS the landing - get out and walk,
+            -- do not wait for the game to remove the boat
+            if sp < 15 and not backing and tick() - tSail > 6 then
+                slowSecs = slowSecs + 1
+            else
+                slowSecs = 0
+            end
+            if slowSecs >= 3 then
+                local fin = route[#route]
+                local dFin = math.sqrt((fin.X - seat.Position.X) ^ 2 + (fin.Y - seat.Position.Z) ^ 2)
+                local landNear = false
+                for k = 0, 7 do
+                    local a = k / 8 * math.pi * 2
+                    local okW, w = pcall(isWater, seat.Position.X + math.cos(a) * 45, seat.Position.Z + math.sin(a) * 45)
+                    if okW and w == false then landNear = true; break end
+                end
+                if landNear and (dFin < 300 or (exitPos and dist(exitPos) < 350)) then
+                    qlog(string.format("boat aground at the shore (%d studs from the end point) -> getting out and walking", dFin))
+                    state = "grounded"
+                end
+                slowSecs = 0
+            end
             if tick() - tSail < 25 then
                 local tg = route[math.min(wp, #route)]
                 qlog(string.format("  t+%.0fs wp %d/%d pos %d,%d,%d speed %d, %d studs to the waypoint, throttle %s steer %s",
@@ -4186,6 +4257,17 @@ setPage("Quest")
         pcall(function() if afkConn then afkConn:Disconnect() end end)
                 qlog("boat trip ended: " .. tostring(state or (running and "timeout" or "stopped")) .. "  waypoint " .. wp .. "/" .. #route)
         qflush(true)
+        -- stop the boat before getting out (it used to keep driving at 100+ studs/s and throw us into the water)
+        if (state == "arrived" or state == "grounded") and seat.Parent then
+            qs.boatNote = "stopping the boat"
+            braking = true
+            waitFor(function()
+                local v = 99
+                pcall(function() v = seat.AssemblyLinearVelocity:Dot(seat.CFrame.LookVector) end)
+                return v < 12 or not seat.Parent or h.SeatPart ~= seat
+            end, 5)
+            braking = false
+        end
         pcall(function() RunService:UnbindFromRenderStep("PPY_BoatThrottle") end)
         pcall(function() seat.ThrottleFloat = 0; seat.SteerFloat = 0 end)
         pcall(function() conn:Disconnect() end)
@@ -4195,13 +4277,20 @@ setPage("Quest")
         qs.boatNote = ""
         task.wait(0.5)
         if swimming() then rescueWater(exitPos) end
-        if state ~= "arrived" then return false, "boat trip " .. tostring(state or "timed out") end
+        if state ~= "arrived" and state ~= "grounded" then return false, "boat trip " .. tostring(state or "timed out") end
         if exitPos then
-            walkTo(exitPos, 40)
-            if swimming() then rescueWater(exitPos); walkTo(exitPos, 20) end
-            if dist(exitPos) > 25 then tp(exitPos) end     -- last resort: could not walk the rest of the way
+            -- walk the rest (swim to the shore first when needed); two tries, a teleport only when both failed
+            for attempt = 1, 2 do
+                if dist(exitPos) < 14 then break end
+                if swimming() then rescueWater(exitPos) end
+                walkTo(exitPos, math.max(40, dist(exitPos) / 7 + 25))
+            end
+            if dist(exitPos) > 25 then
+                qlog("could not walk the last " .. math.floor(dist(exitPos)) .. " studs -> teleport (last resort)")
+                tp(exitPos)
+            end
         end
-        return true, "arrived"
+        return true, state
     end
 
     -- safety net around sail(): whatever goes wrong inside, the throttle callback is unbound and the sailing flag is
@@ -4219,23 +4308,27 @@ setPage("Quest")
     end
 
     -- travel (teleport or boat, with teleport as the fallback) -----------------------------------
-    local function goFarm()
-        local fp = farmPos()
-        if dist(fp) < 60 then return end
-        if Config.QuestTravel == "Boat" then
-            local npc = ticketNpc()
-            local np = npcPos(npc)
-            if np and dist(np) < 700 then
-                local ok, why = sail("Chu Xin 1", ROUTE_TO_FARM, fp)
-                qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to farm)"
-                if ok then task.wait(0.3); faceSea(); respot(true); return end
-                qs.status = "boat failed (" .. tostring(why) .. ") -> teleport"
+    -- go on foot when the way there is dry land (checked along the straight line), teleport only when that is not
+    -- possible or failed. A walk is slower but does not look like a jump across the map.
+    local function gentleGo(pos, look)
+        local d = dist(pos)
+        if d < 14 then return end
+        local r = myRoot()
+        local dry = d <= 450 and r ~= nil
+        if dry then
+            for k = 1, 9 do
+                local f = k / 10
+                local okW, w = pcall(isWater, r.Position.X + (pos.X - r.Position.X) * f, r.Position.Z + (pos.Z - r.Position.Z) * f)
+                if okW and w then dry = false; break end
             end
         end
-        tp(fp, Config.QuestFarmLook)
-        task.wait(1)
-        faceSea()
-        respot(true)
+        if dry then
+            qlog(string.format("walking the last %d studs instead of teleporting", d))
+            if swimming() then rescueWater(pos) end
+            walkTo(pos, d / 7 + 25)
+            if dist(pos) >= 14 and swimming() then rescueWater(pos); walkTo(pos, 30) end
+        end
+        if dist(pos) >= 14 then tp(pos, look); task.wait(1) end
     end
     -- open water as close to `target` as possible (rings around it, nearest ring first; on a ring the spot closest to the
     -- boat wins). Needs a real water hit with 18 studs of clear water around it; where the terrain is not loaded
@@ -4263,23 +4356,66 @@ setPage("Quest")
         end
         return nil
     end
+    -- the closest boat-summon NPC (every island has its own, in a different place)
+    local function nearestBoatNpc()
+        local npcF = Workspace:FindFirstChild("NPC")
+        local sbF = npcF and npcF:FindFirstChild("SpawnBoat")
+        if not sbF then return nil end
+        local best, bd = nil, math.huge
+        for _, m in ipairs(sbF:GetChildren()) do
+            local mp = npcPos(m)
+            local d = mp and dist(mp) or math.huge
+            if d < bd then best, bd = m.Name, d end
+        end
+        return best, bd
+    end
+    local DEFAULT_FARM = Vector3.new(1362, 9, 268)
+    local function goFarm()
+        local fp = farmPos()
+        if dist(fp) < 60 then return end
+        if Config.QuestTravel == "Boat" then
+            local near, nd = nearestBoatNpc()
+            local ok, why = nil, nil
+            if near == "Chu Xin 1" and (fp - DEFAULT_FARM).Magnitude < 250 then
+                ok, why = sail("Chu Xin 1", ROUTE_TO_FARM, fp)                 -- the known route quest island -> battlefield
+            elseif near and nd < 700 then
+                local landing = nil
+                pcall(function() landing = findLanding(fp) end)
+                qlog(string.format("boat: %s -> farm spot (%d,%d), boat NPC '%s' %d studs away", farmIsEasy() and "easy" or "hard", fp.X, fp.Z, near, nd))
+                ok, why = sail(near, { Vector2.new(fp.X, fp.Z) }, fp, landing)
+            end
+            if ok ~= nil then
+                qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to farm)"
+                if ok then task.wait(0.3); faceSea(); respot(true); return end
+                qs.status = "boat failed (" .. tostring(why) .. ") -> walking / teleport"
+            end
+        end
+        gentleGo(fp, farmLook())
+        task.wait(0.3)
+        faceSea()
+        respot(true)
+    end
     local function goNpc()
         local npc = ticketNpc()
         local np = npcPos(npc)
         if not np then qs.status = "Ticket NPC not found"; return false end
         respot(false)
         if dist(np) < 12 then return true end
-        if Config.QuestTravel == "Boat" and dist(farmPos()) < 700 then
+        local near, nd = nil, math.huge
+        if Config.QuestTravel == "Boat" then near, nd = nearestBoatNpc() end
+        if near and nd < 700 then
             local landing, lrad = nil, nil
             pcall(function() landing, lrad = findLanding(np) end)
             qlog(landing and string.format("landing spot %d,%d (%d studs from the NPC)", landing.X, landing.Y, lrad) or "no landing spot found (terrain not loaded?) - using the fixed route end")
-            local ok, why = sail("Chu Xin 9", ROUTE_TO_QUEST, np + Vector3.new(5, 0, 5), landing)
+            -- known route from the battlefield island; any other island: planned (A*) route to the landing spot
+            local route = (near == "Chu Xin 9") and ROUTE_TO_QUEST or { Vector2.new(np.X, np.Z) }
+            local ok, why = sail(near, route, np + Vector3.new(5, 0, 5), landing)
             qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to NPC)"
             if ok and dist(np) < 14 then return true end
             if not ok then qs.status = "boat failed (" .. tostring(why) .. ") -> teleport" end
         end
-        tp(np + Vector3.new(5, 0, 5))
-        task.wait(1.2)
+        gentleGo(np + Vector3.new(5, 0, 5))
+        task.wait(0.5)
         return true
     end
 
@@ -4371,15 +4507,29 @@ setPage("Quest")
         tp(pos)
         task.wait(1.2)
     end
-    local function closeBaitUi()
+    -- press the dialogue's own close / bye button (the game's UI code then ends the dialogue properly)
+    local function pressDialogueClose()
         pcall(function()
             local gui = lp:FindFirstChild("PlayerGui") and lp.PlayerGui:FindFirstChild("MainGui")
             local menu = gui and gui:FindFirstChild("Menu")
-            for _, n in ipairs({ "BaitShop", "Dialogue" }) do
-                local f = menu and menu:FindFirstChild(n)
-                if f and f:IsA("GuiObject") and f.Visible then f.Visible = false end
+            local dlg = menu and menu:FindFirstChild("Dialogue")
+            if not (dlg and dlg.Visible) then return end
+            for _, d in ipairs(dlg:GetDescendants()) do
+                if d:IsA("TextButton") and d.Visible then
+                    local t = tostring(d.Text):lower()
+                    for _, w in ipairs({ "close", "bye", "leave", "goodbye", "exit", "cancel" }) do
+                        if t:find(w, 1, true) then
+                            if firesignal then pcall(firesignal, d.MouseButton1Click) end
+                            return
+                        end
+                    end
+                end
             end
         end)
+    end
+    local function closeBaitUi()
+        closeShop("BaitShop")
+        pressDialogueClose()
     end
     local function baitChooser(opts)
         for i, o in ipairs(opts) do
@@ -4461,6 +4611,37 @@ setPage("Quest")
         return bought > 0
     end
 
+    -- which fishing spot does this quest want? the big simple "use N bait / skill ..." quests -> easy spot (when set),
+    -- everything else (catch fish of a size / kind ...) -> the hard spot
+    local function classifyQuest(t)
+        if not (Config.QuestSplitFarm and Config.QuestFarmPosEasy) then return "hard" end
+        if not (t and t.active and #t.objs > 0) then return nil end
+        local minAmt = tonumber(Config.EasyMinAmount) or 30
+        for _, o in ipairs(t.objs) do
+            local txt = (tostring(o.desc) .. " " .. tostring(o.kind) .. " " .. tostring(o.target)):lower()
+            -- "use N bait / skill", "cast N times": always simple
+            local simple = txt:find("use", 1, true) or txt:find("bait", 1, true) or txt:find("skill", 1, true) or txt:find("cast", 1, true)
+            -- a size / weight / rarity condition makes a fish quest a hard one ("10 fish of 1.5m", "mythic fish" ...)
+            local picky = txt:find("%d%s*m%f[%A]") or txt:find("%d%s*kg") or txt:find("size", 1, true) or txt:find("weight", 1, true)
+                or txt:find("length", 1, true) or txt:find("heavy", 1, true) or txt:find("giant", 1, true) or txt:find("big", 1, true)
+                or txt:find("large", 1, true) or txt:find("rare", 1, true) or txt:find("legend", 1, true) or txt:find("mythic", 1, true)
+                or txt:find("secret", 1, true) or txt:find("exotic", 1, true)
+            -- a big plain count ("Fish 100 times") is simple even when the quest itself is of the Hard difficulty
+            local bulk = (tonumber(o.amount) or 0) >= minAmt and not picky
+            if not (simple or bulk) then return "hard" end
+        end
+        return "easy"
+    end
+    local function applyFarmKind(t)
+        local k = classifyQuest(t)
+        local o = t and t.objs and t.objs[1]
+        local sig = o and (tostring(t.name) .. "|" .. tostring(o.desc) .. "|" .. tostring(o.amount)) or nil
+        if sig and sig ~= qs.lastQuestSig then
+            qs.lastQuestSig = sig
+            qlog(string.format("quest objective: '%s' amount %s kind '%s' target '%s' -> %s farm spot", tostring(o.desc), tostring(o.amount), tostring(o.kind), tostring(o.target), tostring(k)))
+        end
+        if k and k ~= qs.farmKind then qs.farmKind = k end
+    end
     -- one visit to the Ticket NPC: turn in a finished quest and, when the cooldown allows it, take the NEXT
     -- quest right away (same visit), and only then go back to the farm spot
     local function visit()
@@ -4480,6 +4661,7 @@ setPage("Quest")
             qs.status = "no quest accepted - retry in 5 min"
         end
         task.wait(1)
+        applyFarmKind(readTicket())
         if Config.QuestFarm and dist(farmPos()) > 80 then goFarm() end
     end
 
@@ -4508,6 +4690,7 @@ setPage("Quest")
         end
         if not Config.AutoTicketQuest then qs.status = "auto bait: watching the bait stock"; return end
         local t = readTicket()
+        applyFarmKind(t)
         if t.active and not t.done and t.objs[1] and t.objs[1].kind == "UseBait" then pcall(ensureBait) end
         if t.active and not t.done then
             qs.status = "working on the quest"
@@ -4534,8 +4717,34 @@ setPage("Quest")
         end
     end
 
+    -- stop whatever the automation is doing and give the game its UI / character back (used when the quest toggle is
+    -- switched off and by the "Reset" button): no leftover boat steering, no shop / dark overlay left open, normal jump
+    local function resetQuestState(why)
+        qs.cancel = true
+        local t0 = tick()
+        while qs.busy and tick() - t0 < 6 do task.wait(0.2) end      -- the running action sees the flag and stops
+        qs.cancel = false
+        pcall(function() RunService:UnbindFromRenderStep("PPY_BoatThrottle") end)
+        qs.sailing = false
+        pcall(jumpBoost, false)
+        pcall(function()
+            local h = myHum()
+            local seat = h and h.SeatPart
+            if seat and seat:IsA("VehicleSeat") then
+                seat.ThrottleFloat = 0; seat.SteerFloat = 0
+                leaveBoat(seat)                          -- sitting in a boat nobody drives: get out the game's way
+            end
+        end)
+        pcall(closeShop, "BoatShop")
+        pcall(closeShop, "BaitShop")
+        pcall(pressDialogueClose)
+        ui.questBusy = false
+        qs.shop, qs.dlg = nil, nil
+        qs.status = "stopped - boat / UI state reset" .. (why and (" (" .. why .. ")") or "")
+        qlog("reset: " .. tostring(why or "manual"))
+    end
     local function guarded(fn)
-        if qs.busy then return end
+        if qs.busy then qs.status = "busy with another action - wait a moment and press again"; return end
         qs.busy = true
         task.spawn(function()
             local ok, err = pcall(fn)
@@ -4549,11 +4758,12 @@ setPage("Quest")
     -- UI ----------------------------------------------------------------------------------------------
     section("Ticket quest")
     local info = infoCard({
-        { "state", "State" }, { "quest", "Quest" }, { "obj", "Task" }, { "prog", "Progress" }, { "cd", "Cooldown" }, { "pos", "Farm distance" }, { "boat", "Last boat trip" },
+        { "state", "State" }, { "quest", "Quest" }, { "obj", "Task" }, { "prog", "Progress" }, { "cd", "Cooldown" }, { "pos", "Farm spot / distance" }, { "boat", "Last boat trip" },
     }, 0.38)
     toggleButton("Auto ticket quest", 34, Config.AutoTicketQuest, function(v)
         play(clickSound)
         Config.AutoTicketQuest = v
+        if not v and not Config.AutoBuyBait then task.spawn(function() pcall(resetQuestState, "quest turned off") end) end
     end)
     ui.sub("Options")
     toggleButton("Fish at the farm spot meanwhile", 30, Config.QuestFarm, function(v)
@@ -4578,19 +4788,59 @@ setPage("Quest")
             baitBtn.Text = baitText()
         end)
     end
+    actionButton("Reset boat / UI (use if the boat shop acts up)", 28, function()
+        play(clickSound)
+        task.spawn(function() pcall(resetQuestState, "manual") end)
+    end)
     makeSlider("Dialogue click delay", "s", 0.5, 3, 0.1, 0.1, 1, Config.QuestDelay, function(v) Config.QuestDelay = v end)
-    actionButton("Save this position as farm spot", 30, function()
+    toggleButton("Easy spot for simple / big-count quests", 30, Config.QuestSplitFarm, function(v)
+        play(clickSound)
+        Config.QuestSplitFarm = v
+        pcall(markDirty)
+    end)
+    makeSlider("Easy spot when the count is at least", "x", 10, 500, 10, 10, 0, Config.EasyMinAmount or 30, function(v) Config.EasyMinAmount = v; pcall(markDirty) end)
+    actionButton("Save this position as HARD farm spot (fish size etc.)", 30, function()
         play(clickSound)
         local r = myRoot()
         if r then
             Config.QuestFarmPos = { math.floor(r.Position.X), math.floor(r.Position.Y), math.floor(r.Position.Z) }
             local lv = r.CFrame.LookVector
             Config.QuestFarmLook = { lv.X, lv.Z }
+            pcall(markDirty)
         end
     end)
-    actionButton("Go to farm spot", 28, function()
+    actionButton("Save this position as EASY farm spot (use bait / skill)", 30, function()
         play(clickSound)
-        guarded(function() ui.questBusy = true; goFarm() end)
+        local r = myRoot()
+        if r then
+            Config.QuestFarmPosEasy = { math.floor(r.Position.X), math.floor(r.Position.Y), math.floor(r.Position.Z) }
+            local lv = r.CFrame.LookVector
+            Config.QuestFarmLookEasy = { lv.X, lv.Z }
+            pcall(markDirty)
+        end
+    end)
+    actionButton("Go to HARD farm spot", 28, function()
+        play(clickSound)
+        guarded(function()
+            ui.questBusy = true
+            qs.farmKind = "hard"
+            local d = dist(farmPos())
+            if d < 60 then qs.status = string.format("already at the HARD farm spot (%d studs away)", d); return end
+            qs.status = string.format("going to the HARD farm spot (%d studs)", d)
+            goFarm()
+        end)
+    end)
+    actionButton("Go to EASY farm spot", 28, function()
+        play(clickSound)
+        guarded(function()
+            ui.questBusy = true
+            if not Config.QuestFarmPosEasy then qs.status = "easy farm spot not set yet"; return end
+            qs.farmKind = "easy"
+            local d = dist(farmPos())
+            if d < 60 then qs.status = string.format("already at the EASY farm spot (%d studs away)", d); return end
+            qs.status = string.format("going to the EASY farm spot (%d studs)", d)
+            goFarm()
+        end)
     end)
     actionButton("Go to NPC and talk", 28, function()
         play(clickSound)
@@ -4642,7 +4892,7 @@ setPage("Quest")
                 info.prog(o and (math.floor(o.progress) .. " / " .. o.amount .. (t.done and "  DONE" or "")) or "-")
                 info.cd(t.cooldown > 0 and fmtCd(t.cooldown) or "ready")
                 local d = dist(farmPos())
-                info.pos(d == math.huge and "-" or (math.floor(d) .. " studs"))
+                info.pos((farmIsEasy() and "EASY  " or "HARD  ") .. (d == math.huge and "-" or (math.floor(d) .. " studs")))
                 info.boat(qs.boatResult or "-")
                 if (Config.AutoTicketQuest or Config.AutoBuyBait) and not qs.busy then guarded(step) end
             end)
