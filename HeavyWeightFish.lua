@@ -454,10 +454,10 @@ local ui = {}            -- UI setters, filled when the UI is built
 ui.helpSections = {
     { title = "Getting started",        text = "(write your explanation here)" },
     { title = "Auto fish",              text = "(write your explanation here)" },
-    { title = "Auto skill / rhythm",    text = "(Auto skill 可以选你的技能哪一个是回血的哪一个是攻击的可以auto 打boss， Auto rhythm 是无名章鱼的小游戏，可以设置失误多少次安全一点)" },
+    { title = "Auto skill / rhythm",    text = "(write your explanation here)" },
     { title = "Ticket quest",           text = "(write your explanation here)" },
-    { title = "Farm spots (hard / easy / idle)", text = "(Easy是很像那些要use bait 100次，钓鱼100次。。。。。 ， Hard是那些要钓1.5m的鱼， Idle是如果auto ticket farm 冷却期间或者到上限可以save一个地方当作你挂机的地方，  记得要save 那些位置是easy hard idle的)" },
-    { title = "Skill loadout",          text = "(Easy 用低蓄力的技能可以快速做任务，Hard用高伤害， Idle你喜欢给挂机的skill)" },
+    { title = "Farm spots (hard / easy / idle)", text = "(write your explanation here)" },
+    { title = "Skill loadout",          text = "(write your explanation here)" },
     { title = "Auto buy bait",          text = "(write your explanation here)" },
     { title = "Boat travel / reset",    text = "(write your explanation here)" },
     { title = "Performance / black screen", text = "(write your explanation here)" },
@@ -3459,7 +3459,14 @@ setPage("Quest")
             end
             if best then break end
         end
-        if not best then return false end
+        if not best then
+            qlog(string.format("water: swimming at (%d,%.1f,%d) and no shore found within 170 studs", r.Position.X, r.Position.Y, r.Position.Z))
+            return false
+        end
+        if tick() - (qs.lastWaterLog or 0) > 20 then
+            qs.lastWaterLog = tick()
+            qlog(string.format("water: swimming at (%d,%.1f,%d), shore at (%d,%.1f,%d)", r.Position.X, r.Position.Y, r.Position.Z, best.pos.X, best.pos.Y, best.pos.Z))
+        end
         qs.status = "in the water - swimming to the shore"
         local t0, lastJump = tick(), 0
         while running and tick() - t0 < 9 and swimming() do
@@ -4152,7 +4159,10 @@ setPage("Quest")
         local npc = sbF and sbF:FindFirstChild(spawnNpc)
         local pos = npcPos(npc)
         if not pos then return false, "boat NPC not found" end
-        if dist(pos) > 8 and not walkTo(pos + Vector3.new(3, 0, 3), 45) then tp(pos + Vector3.new(3, 0, 3)); task.wait(1) end
+        if dist(pos) > 8 and not walkTo(pos + Vector3.new(3, 0, 3), 45) then
+            qlog(string.format("boat: could not walk to the boat NPC (%d studs away, swimming=%s) -> teleport next to it", dist(pos), tostring(swimming())))
+            tp(pos + Vector3.new(3, 0, 3)); task.wait(1)
+        end
         qs.shop = nil
         local ok, why = talk(npc, "SpawnBoat", function(opts)
             for i, o in ipairs(opts) do if o[2] == "BoatShop" then return i, o[2] end end
@@ -4200,12 +4210,24 @@ setPage("Quest")
         local seat, h = boat.VehicleSeat, myHum()
         if not h then return false, "no humanoid" end
         task.wait(1.0)   -- the boat drops onto the water first: let it settle before sitting
+        waitFor(function()                                    -- ... wait until it stops moving
+            local v = 99
+            pcall(function() v = seat.AssemblyLinearVelocity.Magnitude end)
+            return v < 4
+        end, 3)
         local seated = false
         for try = 1, 7 do
-            if try > 1 then
-                qlog("sit attempt " .. try .. " (seat y " .. string.format("%.1f", seat.Position.Y) .. ", state " .. tostring(h:GetState()) .. ")")
-                task.wait(0.6 * try)   -- big boats (Omega) take longer to settle on the water
+            do   -- diagnostics for every attempt (why can the character not sit?)
+                local rr = myRoot()
+                local occ, dis, vel = "?", "?", 0
+                pcall(function() occ = tostring(seat.Occupant) end)
+                pcall(function() dis = tostring(seat.Disabled) end)
+                pcall(function() vel = seat.AssemblyLinearVelocity.Magnitude end)
+                qlog(string.format("sit attempt %d: seat (%d,%.1f,%d) vel %.1f occupant %s disabled %s | me %s from the seat, state %s",
+                    try, seat.Position.X, seat.Position.Y, seat.Position.Z, vel, occ, dis,
+                    rr and string.format("%d studs", (rr.Position - seat.Position).Magnitude) or "?", tostring(h:GetState())))
             end
+            if try > 1 then task.wait(0.6 * try) end            -- big boats (Omega) take longer to settle on the water
             local r = myRoot()
             if try >= 3 then                                    -- stuck in Freefall / Swimming: reset the humanoid state first
                 pcall(function() h.Sit = false; h:ChangeState(Enum.HumanoidStateType.Running) end)
@@ -4289,7 +4311,7 @@ setPage("Quest")
             unseatAt = nil
             local p, target = seat.Position, route[wp]
             local d = Vector3.new(target.X - p.X, 0, target.Y - p.Z)
-            if d.Magnitude < ((wp >= #route and landing) and 40 or 70) then   -- the landing point: get closer to the shore
+            if d.Magnitude < ((wp >= #route and landing) and 40 or (wp >= #route - 2 and 50 or 70)) then   -- the landing point: get closer to the shore
                 wp = wp + 1
                 if wp > #route then state = "arrived"; bv.Velocity = Vector3.zero; conn:Disconnect(); return end
                 target = route[wp]
@@ -4332,7 +4354,7 @@ setPage("Quest")
                     pcall(function() vel = seat.AssemblyLinearVelocity:Dot(look) end)
                     local dw = math.sqrt((target.X - p.X) ^ 2 + (target.Y - p.Z) ^ 2)
                     local cap = nil
-                    if wp >= #route - 1 and dw < 220 then cap = 60 end                    -- the last two waypoints sit next to the shore
+                    if wp >= #route - 2 and dw < 300 then cap = 55 end                    -- the last three waypoints sit next to the shore
                     if dw < 170 and math.abs(err) > 0.5 then cap = math.min(cap or 999, 70) end
                     if wp >= #route and dw < 110 then cap = 40 end
                     if cap then
@@ -4453,6 +4475,7 @@ setPage("Quest")
         return true, state
     end
 
+    -- (boat trips are retried once below when the boat would not appear / could not be boarded)
     -- safety net around sail(): whatever goes wrong inside, the throttle callback is unbound and the sailing flag is
     -- cleared (a stale PPY_BoatThrottle binding would make the next trip silently steer the old boat)
     ui.rawSail = sail
@@ -4467,6 +4490,17 @@ setPage("Quest")
         return res[2], res[3]
     end
 
+    -- one more try with a fresh boat when it could not be boarded (a teleport across the sea is the last resort, not the first)
+    local function sailRetry(...)
+        local args = table.pack(...)
+        local ok, why = sail(table.unpack(args, 1, args.n))
+        if not ok and running and not qs.cancel and (tostring(why):find("could not sit", 1, true) or tostring(why):find("did not appear", 1, true)) then
+            qlog("boat: '" .. tostring(why) .. "' - trying once more with a new boat")
+            task.wait(4)
+            ok, why = sail(table.unpack(args, 1, args.n))
+        end
+        return ok, why
+    end
     -- travel (teleport or boat, with teleport as the fallback) -----------------------------------
     -- go on foot when the way there is dry land (checked along the straight line), teleport only when that is not
     -- possible or failed. A walk is slower but does not look like a jump across the map.
@@ -4543,21 +4577,34 @@ setPage("Quest")
         return best, bd
     end
     local DEFAULT_FARM = Vector3.new(1362, 9, 268)
+    -- are we away from the farm spot? Far away (> 80): yes. Close but not on it (16..80) and the way is walkable: yes, go to
+    -- the exact spot (the saved spot has a facing and a cast position); checked at most once every 90 s so that a spot we
+    -- cannot quite reach does not make us walk back and forth.
+    local function needFarmMove()
+        local d = dist(farmPos())
+        if d > 80 then return true end
+        if d <= 16 then return false end
+        if tick() - (qs.lastFine or 0) < 90 then return false end
+        qs.lastFine = tick()
+        return pathExists(farmPos())
+    end
     local function goFarm()
         local fp = farmPos()
-        if dist(fp) < 60 then return end
+        local d0 = dist(fp)
+        if d0 <= 16 then return end
+        if d0 < 80 and not pathExists(fp) then return end
         local walkable = dist(fp) <= 450 and pathExists(fp)       -- close and on the same land: walk, no boat
         if walkable then qlog(string.format("farm spot is %d studs away and walkable - no boat", dist(fp))) end
         if Config.QuestTravel == "Boat" and not walkable then
             local near, nd = nearestBoatNpc()
             local ok, why = nil, nil
             if near == "Chu Xin 1" and (fp - DEFAULT_FARM).Magnitude < 250 then
-                ok, why = sail("Chu Xin 1", ROUTE_TO_FARM, fp)                 -- the known route quest island -> battlefield
+                ok, why = sailRetry("Chu Xin 1", ROUTE_TO_FARM, fp)                 -- the known route quest island -> battlefield
             elseif near and nd < 700 then
                 local landing = nil
                 pcall(function() landing = findLanding(fp) end)
                 qlog(string.format("boat: %s -> farm spot (%d,%d), boat NPC '%s' %d studs away", farmKindNow(), fp.X, fp.Z, near, nd))
-                ok, why = sail(near, { Vector2.new(fp.X, fp.Z) }, fp, landing)
+                ok, why = sailRetry(near, { Vector2.new(fp.X, fp.Z) }, fp, landing)
             end
             if ok ~= nil then
                 qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to farm)"
@@ -4586,7 +4633,7 @@ setPage("Quest")
             qlog(landing and string.format("landing spot %d,%d (%d studs from the NPC)", landing.X, landing.Y, lrad) or "no landing spot found (terrain not loaded?) - using the fixed route end")
             -- known route from the battlefield island; any other island: planned (A*) route to the landing spot
             local route = (near == "Chu Xin 9") and ROUTE_TO_QUEST or { Vector2.new(np.X, np.Z) }
-            local ok, why = sail(near, route, np + Vector3.new(5, 0, 5), landing)
+            local ok, why = sailRetry(near, route, np + Vector3.new(5, 0, 5), landing)
             qs.boatResult = (ok and "OK" or "FAILED: ") .. (ok and "" or tostring(why)) .. " (to NPC)"
             if ok and dist(np) < 14 then return true end
             if not ok then qs.status = "boat failed (" .. tostring(why) .. ") -> teleport" end
@@ -4921,7 +4968,7 @@ setPage("Quest")
         end
         task.wait(1)
         applyFarmKind(readTicket())
-        if Config.QuestFarm and dist(farmPos()) > 80 then goFarm() end
+        if Config.QuestFarm and needFarmMove() then goFarm() end
     end
 
     -- one decision step ----------------------------------------------------------------------------
@@ -4964,7 +5011,7 @@ setPage("Quest")
         if t.active and not t.done and t.objs[1] and t.objs[1].kind == "UseBait" then pcall(ensureBait) end
         if t.active and not t.done then
             qs.status = "working on the quest"
-            if Config.QuestFarm and dist(farmPos()) > 80 then
+            if Config.QuestFarm and needFarmMove() then
                 ui.questBusy = true
                 goFarm()
                 ui.questBusy = false
@@ -4979,7 +5026,7 @@ setPage("Quest")
             ui.questBusy = false
         else
             qs.status = "cooldown - fishing at the farm spot"
-            if Config.QuestFarm and dist(farmPos()) > 80 then
+            if Config.QuestFarm and needFarmMove() then
                 ui.questBusy = true
                 goFarm()
                 ui.questBusy = false
@@ -5215,7 +5262,7 @@ setPage("Quest")
             if not Config.QuestFarmPosIdle then qs.status = "idle farm spot not set yet"; return end
             qs.farmKind = "idle"
             local d = dist(farmPos())
-            if d < 60 then qs.status = string.format("already at the IDLE farm spot (%d studs away)", d); return end
+            if d <= 16 then qs.status = string.format("already at the IDLE farm spot (%d studs away)", d); return end
             qs.status = string.format("going to the IDLE farm spot (%d studs)", d)
             goFarm()
         end)
@@ -5226,7 +5273,7 @@ setPage("Quest")
             ui.questBusy = true
             qs.farmKind = "hard"
             local d = dist(farmPos())
-            if d < 60 then qs.status = string.format("already at the HARD farm spot (%d studs away)", d); return end
+            if d <= 16 then qs.status = string.format("already at the HARD farm spot (%d studs away)", d); return end
             qs.status = string.format("going to the HARD farm spot (%d studs)", d)
             goFarm()
         end)
@@ -5238,7 +5285,7 @@ setPage("Quest")
             if not Config.QuestFarmPosEasy then qs.status = "easy farm spot not set yet"; return end
             qs.farmKind = "easy"
             local d = dist(farmPos())
-            if d < 60 then qs.status = string.format("already at the EASY farm spot (%d studs away)", d); return end
+            if d <= 16 then qs.status = string.format("already at the EASY farm spot (%d studs away)", d); return end
             qs.status = string.format("going to the EASY farm spot (%d studs)", d)
             goFarm()
         end)
