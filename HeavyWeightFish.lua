@@ -83,6 +83,9 @@ local Config = {
     QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
     QuestFarmPosEasy = nil,            -- second spot (easy / quick island) for "use N bait / skill" quests; nil = not set
     QuestFarmLookEasy = nil,
+    SkillLoadout = false,              -- equip a set of up to 3 skills for each fishing spot (see the Skill loadout section)
+    SkillEasy = { "", "", "" },        -- skills used at the EASY farm spot ("" = empty)
+    SkillHard = { "", "", "" },        -- skills used at the HARD farm spot
     EasyMinAmount = 30,                -- a plain "do it N times" quest with N at or above this goes to the easy spot
     QuestSplitFarm = true,             -- use the easy spot for the big, simple "use ..." quests (when it is set)
     BoatName = "Auto", -- "Auto" = the fastest boat you own; or type an exact boat name
@@ -492,6 +495,7 @@ local function saveSettings()
             BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel,
             QuestFarmPos = Config.QuestFarmPos, QuestFarmLook = Config.QuestFarmLook, QuestFarmPosEasy = Config.QuestFarmPosEasy,
             QuestFarmLookEasy = Config.QuestFarmLookEasy, QuestSplitFarm = Config.QuestSplitFarm, EasyMinAmount = Config.EasyMinAmount,
+            SkillLoadout = Config.SkillLoadout, SkillEasy = Config.SkillEasy, SkillHard = Config.SkillHard,
         }))
     end)
 end
@@ -525,6 +529,10 @@ local function loadSettings()
                 if isPos(data.QuestFarmPosEasy) then Config.QuestFarmPosEasy = data.QuestFarmPosEasy end
                 if isLook(data.QuestFarmLookEasy) then Config.QuestFarmLookEasy = data.QuestFarmLookEasy end
                 if type(data.QuestSplitFarm) == "boolean" then Config.QuestSplitFarm = data.QuestSplitFarm end
+                local function isNames(v) if type(v) ~= "table" then return false end for i = 1, 3 do if type(v[i]) ~= "string" then return false end end return true end
+                if type(data.SkillLoadout) == "boolean" then Config.SkillLoadout = data.SkillLoadout end
+                if isNames(data.SkillEasy) then Config.SkillEasy = { data.SkillEasy[1], data.SkillEasy[2], data.SkillEasy[3] } end
+                if isNames(data.SkillHard) then Config.SkillHard = { data.SkillHard[1], data.SkillHard[2], data.SkillHard[3] } end
                 if type(data.EasyMinAmount) == "number" then Config.EasyMinAmount = math.clamp(math.floor(data.EasyMinAmount), 1, 500) end
                 if type(data.WebhookLive) == "boolean" then Config.WebhookLive = data.WebhookLive end
                 if type(data.LiveInterval) == "number" then Config.LiveInterval = math.clamp(math.floor(data.LiveInterval), 10, 300) end
@@ -2594,6 +2602,104 @@ local function makeDropdown(title, options, initial, onPick)
     refresh()
 end
 
+-- dropdown with a search box (for long lists, e.g. your skills): getOptions() is read each time it is opened, "" = none
+local function makeSearchPicker(title, getOptions, getValue, onPick)
+    local holder = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = nextOrder(),
+    }, Body)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, holder)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 1, Font = Enum.Font.GothamMedium, TextSize = 11,
+        BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, BorderSizePixel = 0,
+    }, holder)
+    corner(btn, 6)
+    local panel = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 2, Visible = false,
+    }, holder)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }, panel)
+    local box = new("TextBox", {
+        Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 1, BackgroundColor3 = COL_ROW, BorderSizePixel = 0, Text = "",
+        PlaceholderText = "type to search...", PlaceholderColor3 = Color3.fromRGB(120, 120, 120),
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 11, ClearTextOnFocus = false,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
+    corner(box, 6)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, box)
+    local list = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 0, 130), LayoutOrder = 2, BackgroundColor3 = COL_ROW, BorderSizePixel = 0,
+        ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, panel)
+    corner(list, 6)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, list)
+    local function refreshTitle()
+        local v = getValue()
+        btn.Text = title .. ":  " .. ((v ~= nil and v ~= "") and v or "none") .. (panel.Visible and "   ▴" or "   ▾")
+    end
+    local function rebuild()
+        for _, c in ipairs(list:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        local q = string.lower(box.Text or "")
+        local cur = getValue()
+        local opts = { "" }
+        for _, o in ipairs(getOptions()) do opts[#opts + 1] = o end
+        local n = 0
+        for _, name in ipairs(opts) do
+            if q == "" or name == "" or string.find(string.lower(name), q, 1, true) then
+                n = n + 1
+                local ob = new("TextButton", {
+                    Size = UDim2.new(1, -4, 0, 22), LayoutOrder = n, Text = (name == "") and "(none)" or name, Font = Enum.Font.Gotham,
+                    TextSize = 10, BackgroundColor3 = (name == cur) and Color3.fromRGB(0, 70, 45) or COL_ROW,
+                    TextColor3 = (name == cur) and COL_GREEN or Color3.new(1, 1, 1), BorderSizePixel = 0,
+                }, list)
+                corner(ob, 4)
+                ob.MouseButton1Click:Connect(function()
+                    play(clickSound)
+                    panel.Visible = false
+                    onPick(name)
+                    refreshTitle()
+                end)
+            end
+        end
+    end
+    box:GetPropertyChangedSignal("Text"):Connect(rebuild)
+    btn.MouseButton1Click:Connect(function()
+        play(clickSound)
+        panel.Visible = not panel.Visible
+        if panel.Visible then box.Text = ""; rebuild() end
+        refreshTitle()
+    end)
+    refreshTitle()
+    return refreshTitle
+end
+
+-- a panel whose rows are rebuilt on demand: setRows({ { text = "...", color = Color3, on = function() end }, ... })
+function ui.makeRowsPanel()
+    local holder = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = nextOrder(),
+    }, Body)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }, holder)
+    return function(rows)
+        for _, c in ipairs(holder:GetChildren()) do
+            if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+        end
+        if #rows == 0 then
+            new("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1, BackgroundTransparency = 1, Text = "(no skills equipped right now)",
+                TextColor3 = Color3.fromRGB(150, 150, 150), Font = Enum.Font.Gotham, TextSize = 10,
+            }, holder)
+        end
+        for i, r in ipairs(rows) do
+            local b = new("TextButton", {
+                Size = UDim2.new(1, 0, 0, 26), LayoutOrder = i, Text = r.text, Font = Enum.Font.GothamMedium, TextSize = 11,
+                BackgroundColor3 = COL_ROW, TextColor3 = r.color or Color3.new(1, 1, 1), BorderSizePixel = 0,
+            }, holder)
+            corner(b, 6)
+            b.MouseButton1Click:Connect(function() play(clickSound); r.on() end)
+        end
+    end
+end
+
 -- generic info card (label on the left, value on the right) -------------
 local function infoCard(rows, labelFrac)
     labelFrac = labelFrac or 0.45
@@ -4051,9 +4157,13 @@ setPage("Quest")
                 task.wait(0.6 * try)   -- big boats (Omega) take longer to settle on the water
             end
             local r = myRoot()
+            if try >= 3 then                                    -- stuck in Freefall / Swimming: reset the humanoid state first
+                pcall(function() h.Sit = false; h:ChangeState(Enum.HumanoidStateType.Running) end)
+                task.wait(0.3)
+            end
             if r then
                 pcall(function() r.AssemblyLinearVelocity = Vector3.zero end)
-                r.CFrame = seat.CFrame * CFrame.new(0, 2, 0)
+                r.CFrame = seat.CFrame * CFrame.new(0, (try >= 4) and 3.5 or 2, 0)
             end
             pcall(function() seat:Sit(h) end)
             if waitFor(function() return h.SeatPart == seat end, 2) then
@@ -4310,12 +4420,25 @@ setPage("Quest")
     -- travel (teleport or boat, with teleport as the fallback) -----------------------------------
     -- go on foot when the way there is dry land (checked along the straight line), teleport only when that is not
     -- possible or failed. A walk is slower but does not look like a jump across the map.
+    -- is there a walkable route to `pos`? (the navmesh says so, no walking yet)
+    local function pathExists(pos)
+        local r = myRoot()
+        if not r then return false end
+        local ok, res = pcall(function()
+            local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 6 })
+            path:ComputeAsync(r.Position, pos)
+            return path.Status == Enum.PathStatus.Success
+        end)
+        return ok and res == true
+    end
     local function gentleGo(pos, look)
         local d = dist(pos)
         if d < 14 then return end
         local r = myRoot()
         local dry = d <= 450 and r ~= nil
-        if dry then
+        if dry and pathExists(pos) then
+            -- the navmesh knows a way: no need to guess from the straight line
+        elseif dry then
             for k = 1, 9 do
                 local f = k / 10
                 local okW, w = pcall(isWater, r.Position.X + (pos.X - r.Position.X) * f, r.Position.Z + (pos.Z - r.Position.Z) * f)
@@ -4373,7 +4496,9 @@ setPage("Quest")
     local function goFarm()
         local fp = farmPos()
         if dist(fp) < 60 then return end
-        if Config.QuestTravel == "Boat" then
+        local walkable = dist(fp) <= 450 and pathExists(fp)       -- close and on the same land: walk, no boat
+        if walkable then qlog(string.format("farm spot is %d studs away and walkable - no boat", dist(fp))) end
+        if Config.QuestTravel == "Boat" and not walkable then
             local near, nd = nearestBoatNpc()
             local ok, why = nil, nil
             if near == "Chu Xin 1" and (fp - DEFAULT_FARM).Magnitude < 250 then
@@ -4402,7 +4527,9 @@ setPage("Quest")
         respot(false)
         if dist(np) < 12 then return true end
         local near, nd = nil, math.huge
-        if Config.QuestTravel == "Boat" then near, nd = nearestBoatNpc() end
+        local walkable = dist(np) <= 450 and pathExists(np + Vector3.new(5, 0, 5))
+        if walkable then qlog(string.format("quest NPC is %d studs away and walkable - no boat", dist(np))) end
+        if Config.QuestTravel == "Boat" and not walkable then near, nd = nearestBoatNpc() end
         if near and nd < 700 then
             local landing, lrad = nil, nil
             pcall(function() landing, lrad = findLanding(np) end)
@@ -4640,7 +4767,70 @@ setPage("Quest")
             qs.lastQuestSig = sig
             qlog(string.format("quest objective: '%s' amount %s kind '%s' target '%s' -> %s farm spot", tostring(o.desc), tostring(o.amount), tostring(o.kind), tostring(o.target), tostring(k)))
         end
+        if not k and not (t and t.active) and Config.QuestSplitFarm and Config.QuestFarmPosEasy then
+            -- no quest running (cooldown): fish at the spot nearest to the ticket NPC, so the next hand-in is a short trip
+            local np = npcPos(ticketNpc())
+            if np then
+                local e, h = Config.QuestFarmPosEasy, Config.QuestFarmPos
+                local de = (Vector3.new(e[1], e[2], e[3]) - np).Magnitude
+                local dh = (Vector3.new(h[1], h[2], h[3]) - np).Magnitude
+                k = (de < dh) and "easy" or "hard"
+            end
+        end
         if k and k ~= qs.farmKind then qs.farmKind = k end
+    end
+    -- skill loadout: up to 3 skills for each fishing spot. Skills owned = Data.Skill children; the rod's slots live in
+    -- Data.FishingRodInventory[<rod>].Skill[Z/X/C/V]; Events.EquipSkill:InvokeServer(name) toggles one skill.
+    local function ownedSkills()
+        local out = {}
+        local d = getData()
+        local f = d and d:FindFirstChild("Skill")
+        if f then for _, c in ipairs(f:GetChildren()) do out[#out + 1] = c.Name end end
+        table.sort(out)
+        return out
+    end
+    local function equippedSkills()
+        local out = {}
+        pcall(function()
+            local d = getData()
+            local inv = d.FishingRodInventory:FindFirstChild(d.FishingRod.Value)
+            local sk = inv and inv:FindFirstChild("Skill")
+            if sk then for _, c in ipairs(sk:GetChildren()) do if type(c.Value) == "string" and c.Value ~= "" then out[#out + 1] = c.Value end end end
+        end)
+        return out
+    end
+    local function hasSkill(name) for _, n in ipairs(equippedSkills()) do if n == name then return true end end return false end
+    local function applyLoadout(kind)
+        local list = (kind == "easy") and Config.SkillEasy or Config.SkillHard
+        local want, set = {}, {}
+        for i = 1, 3 do local n = list and list[i]; if type(n) == "string" and n ~= "" and not set[n] then want[#want + 1] = n; set[n] = true end end
+        if #want == 0 then return true end
+        local ev = RS:FindFirstChild("Events")
+        local r = ev and ev:FindFirstChild("EquipSkill")
+        if not r then qlog("skills: EquipSkill remote missing"); return false end
+        local owned = {}
+        for _, n in ipairs(ownedSkills()) do owned[n] = true end
+        for _, n in ipairs(equippedSkills()) do                      -- free the slots of skills that are not wanted
+            if not set[n] then
+                pcall(function() r:InvokeServer(n) end)
+                waitFor(function() return not hasSkill(n) end, 3)
+                task.wait(0.3)
+            end
+        end
+        local missing = {}
+        for _, n in ipairs(want) do
+            if not hasSkill(n) then
+                if not owned[n] then missing[#missing + 1] = n
+                else
+                    pcall(function() r:InvokeServer(n) end)
+                    if not waitFor(function() return hasSkill(n) end, 3) then missing[#missing + 1] = n end
+                    task.wait(0.3)
+                end
+            end
+        end
+        qlog(string.format("skills (%s spot): wanted %s -> equipped %s%s", kind, table.concat(want, ", "), table.concat(equippedSkills(), ", "),
+            #missing > 0 and ("  (could not equip: " .. table.concat(missing, ", ") .. ")") or ""))
+        return #missing == 0
     end
     -- one visit to the Ticket NPC: turn in a finished quest and, when the cooldown allows it, take the NEXT
     -- quest right away (same visit), and only then go back to the farm spot
@@ -4691,6 +4881,17 @@ setPage("Quest")
         if not Config.AutoTicketQuest then qs.status = "auto bait: watching the bait stock"; return end
         local t = readTicket()
         applyFarmKind(t)
+        if Config.SkillLoadout and dist(farmPos()) < 80 then
+            local kind = farmIsEasy() and "easy" or "hard"
+            if qs.loadoutKind ~= kind and tick() >= (qs.loadoutRetry or 0) then
+                ui.questBusy = true
+                qs.status = "equipping the " .. kind .. " skill loadout"
+                local okL, resL = pcall(applyLoadout, kind)
+                ui.questBusy = false
+                qs.loadoutKind = kind
+                if not (okL and resL) then qs.loadoutRetry = tick() + 120; qs.loadoutKind = nil end
+            end
+        end
         if t.active and not t.done and t.objs[1] and t.objs[1].kind == "UseBait" then pcall(ensureBait) end
         if t.active and not t.done then
             qs.status = "working on the quest"
@@ -4788,6 +4989,96 @@ setPage("Quest")
             baitBtn.Text = baitText()
         end)
     end
+    ui.endSub()
+    ui.sub("Skill loadout per spot (3 skills each)")
+    toggleButton("Equip the skills below at each spot", 30, Config.SkillLoadout, function(v)
+        play(clickSound)
+        Config.SkillLoadout = v
+        qs.loadoutKind = nil
+        pcall(markDirty)
+    end)
+    do
+        -- 1) the skills you are using right now: tap a row to cycle  OFF -> EASY -> HARD -> BOTH
+        local setRows = ui.makeRowsPanel()
+        local pickerRefresh = {}
+        local function inList(t, n) for i = 1, 3 do if t[i] == n then return i end end end
+        local function putIn(t, n)
+            if inList(t, n) then return true end
+            for i = 1, 3 do if t[i] == "" then t[i] = n; return true end end
+            return false
+        end
+        local function takeOut(t, n) local i = inList(t, n); if i then t[i] = "" end end
+        local function roleOf(n)
+            local e, h = inList(Config.SkillEasy, n), inList(Config.SkillHard, n)
+            if e and h then return "both" elseif e then return "easy" elseif h then return "hard" end
+            return "off"
+        end
+        local function setRole(n, role)
+            local oe, oh = { table.unpack(Config.SkillEasy) }, { table.unpack(Config.SkillHard) }
+            takeOut(Config.SkillEasy, n); takeOut(Config.SkillHard, n)
+            local ok = true
+            if role == "easy" or role == "both" then ok = putIn(Config.SkillEasy, n) and ok end
+            if role == "hard" or role == "both" then ok = putIn(Config.SkillHard, n) and ok end
+            if not ok then                                           -- that list is full (3): undo
+                for i = 1, 3 do Config.SkillEasy[i], Config.SkillHard[i] = oe[i], oh[i] end
+                return false
+            end
+            return true
+        end
+        local NEXT = { off = "easy", easy = "hard", hard = "both", both = "off" }
+        local COLORS = { off = Color3.fromRGB(150, 150, 150), easy = Color3.fromRGB(90, 200, 120), hard = Color3.fromRGB(240, 170, 70), both = Color3.fromRGB(120, 170, 255) }
+        local lastSig = nil
+        local function rebuild(force)
+            local names, seen = {}, {}
+            for _, n in ipairs(equippedSkills()) do if not seen[n] then seen[n] = true; names[#names + 1] = n end end
+            for _, t in ipairs({ Config.SkillEasy, Config.SkillHard }) do
+                for i = 1, 3 do local n = t[i]; if n ~= "" and not seen[n] then seen[n] = true; names[#names + 1] = n end end
+            end
+            local sig = table.concat(names, ",") .. "|" .. table.concat(Config.SkillEasy, ",") .. "|" .. table.concat(Config.SkillHard, ",")
+            if not force and sig == lastSig then return end
+            lastSig = sig
+            local rows = {}
+            for _, n in ipairs(names) do
+                local role = roleOf(n)
+                rows[#rows + 1] = {
+                    text = n .. (hasSkill(n) and "" or "  (not equipped)") .. "   ->   " .. string.upper(role == "off" and "off" or role),
+                    color = COLORS[role],
+                    on = function()
+                        local r = NEXT[roleOf(n)]
+                        for _ = 1, 4 do                              -- skip roles whose list is full
+                            if setRole(n, r) then break end
+                            r = NEXT[r]
+                        end
+                        qs.loadoutKind = nil
+                        pcall(markDirty)
+                        rebuild(true)
+                        for _, f in ipairs(pickerRefresh) do pcall(f) end
+                    end,
+                }
+            end
+            setRows(rows)
+        end
+        ui.refreshSkillRows = rebuild
+        rebuild(true)
+        -- 2) add skills you are not wearing now: searchable list of everything you own
+        local function skillBtn(label, tbl, i)
+            pickerRefresh[#pickerRefresh + 1] = makeSearchPicker(label .. " " .. i, ownedSkills, function() return tbl[i] end, function(v)
+                if v ~= "" then takeOut(tbl, v) end
+                tbl[i] = v
+                qs.loadoutKind = nil
+                pcall(markDirty)
+                rebuild(true)
+            end)
+        end
+        for i = 1, 3 do skillBtn("EASY spot skill", Config.SkillEasy, i) end
+        for i = 1, 3 do skillBtn("HARD spot skill", Config.SkillHard, i) end
+    end
+    actionButton("Equip the loadout for the current spot now", 28, function()
+        play(clickSound)
+        guarded(function() ui.questBusy = true; applyLoadout(farmIsEasy() and "easy" or "hard") end)
+    end)
+    ui.endSub()
+    ui.sub("Options (more)")
     actionButton("Reset boat / UI (use if the boat shop acts up)", 28, function()
         play(clickSound)
         task.spawn(function() pcall(resetQuestState, "manual") end)
@@ -4894,6 +5185,7 @@ setPage("Quest")
                 local d = dist(farmPos())
                 info.pos((farmIsEasy() and "EASY  " or "HARD  ") .. (d == math.huge and "-" or (math.floor(d) .. " studs")))
                 info.boat(qs.boatResult or "-")
+                if ui.refreshSkillRows then pcall(ui.refreshSkillRows, false) end
                 if (Config.AutoTicketQuest or Config.AutoBuyBait) and not qs.busy then guarded(step) end
             end)
         end
