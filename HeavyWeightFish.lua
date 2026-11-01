@@ -13,7 +13,7 @@
                                                          + OnClientEvent(replyRemote) -> replyRemote:FireServer(...)
                              Events.UseSkill / Events.TriggerMinigameSkill -> FireServer("Z"/"X"/"C"/"V")
                              Events.SellFish           -> FireServer("All")
-                             Events.FavoriteItem       -> FireServer(item)
+                             Events.FavoriteItem       -> FireServer(item.Name)  (the whole name string, e.g. " Fish | 12.5 KG")
                              Data[UserId].Hotbar / Inventory (items have .Favorite) / InventoryLimit
     Anti-AFK   : Player.Idled + VirtualUser (click) so Roblox does not kick you after 20 min idle
     Human break: random pauses of Auto Cast, a few steps around the fishing spot, back + face the sea, cast again
@@ -102,7 +102,8 @@ local Config = {
     AutoSell = false,
     SellInterval = 30,        -- seconds between automatic sells
     AutoFavourite = false,    -- protect the chosen fish from being sold
-    FavouriteFishName = "Colossal Tigerfish",
+    FavouriteFishName = "Colossal Tigerfish",   -- (old single setting, kept for compatibility)
+    FavouriteFishList = { "Colossal Tigerfish" },   -- every fish name in here is locked (favourited) automatically
     MaterialFarming = false,  -- protect the craft-material fish from being sold
     -- utilities
     AntiAFK = true,
@@ -347,6 +348,16 @@ local function pressKey(code)
     end)
 end
 
+-- inventory item names look like " Colossal Tigerfish | 12.5 KG" (and get " | Favorite" appended once locked);
+-- the game itself sends that whole name string to Events.FavoriteItem
+function Config.FishBase(itemName)
+    local first = string.match(itemName, "^([^|]*)") or itemName
+    return (string.match(first, "^%s*(.-)%s*$")) or first
+end
+function Config.FavHas(name)
+    for _, n in ipairs(Config.FavouriteFishList) do if n == name then return true end end
+    return false
+end
 -- Economy: mark the protected fish as favourite (returns how many requests were sent)
 local function protectFish(pData, now)
     if not (Config.AutoFavourite or Config.MaterialFarming) then return 0 end
@@ -357,15 +368,16 @@ local function protectFish(pData, now)
     local sent = 0
     for _, item in ipairs(inv:GetChildren()) do
         local fav = item:FindFirstChild("Favorite")
-        local isFav = (fav ~= nil and fav.Value == true)
+        local isFav = (fav ~= nil and fav.Value == true) or string.find(item.Name, "| Favorite", 1, true) ~= nil
         if not isFav then
-            local name = item.Name
-            local want = (Config.MaterialFarming and CRAFT_FISH[name]) or (Config.AutoFavourite and name == Config.FavouriteFishName)
+            local name = Config.FishBase(item.Name)
+            local want = (Config.MaterialFarming and CRAFT_FISH[name]) or (Config.AutoFavourite and Config.FavHas(name))
             if want then
                 local last = favRequested[item]
                 if last == nil or now - last >= FAV_RETRY then
                     favRequested[item] = now
-                    pcall(function() favRemote:FireServer(item) end)
+                    local itemName = item.Name
+                    pcall(function() favRemote:FireServer(itemName) end)
                     sent = sent + 1
                 end
             end
@@ -517,7 +529,7 @@ local function saveSettings()
             QuestFarmPos = Config.QuestFarmPos, QuestFarmLook = Config.QuestFarmLook, QuestFarmPosEasy = Config.QuestFarmPosEasy,
             QuestFarmLookEasy = Config.QuestFarmLookEasy, QuestSplitFarm = Config.QuestSplitFarm, EasyMinAmount = Config.EasyMinAmount,
             SkillLoadout = Config.SkillLoadout, SkillEasy = Config.SkillEasy, SkillHard = Config.SkillHard,
-            SkillIdle = Config.SkillIdle, QuestFarmPosIdle = Config.QuestFarmPosIdle, QuestFarmLookIdle = Config.QuestFarmLookIdle, IdleSpotOn = Config.IdleSpotOn,
+            FavouriteFishList = Config.FavouriteFishList, SkillIdle = Config.SkillIdle, QuestFarmPosIdle = Config.QuestFarmPosIdle, QuestFarmLookIdle = Config.QuestFarmLookIdle, IdleSpotOn = Config.IdleSpotOn,
         }))
     end)
 end
@@ -557,6 +569,11 @@ local function loadSettings()
                 if isNames(data.SkillIdle) then Config.SkillIdle = { data.SkillIdle[1], data.SkillIdle[2], data.SkillIdle[3] } end
                 if isPos(data.QuestFarmPosIdle) then Config.QuestFarmPosIdle = data.QuestFarmPosIdle end
                 if isLook(data.QuestFarmLookIdle) then Config.QuestFarmLookIdle = data.QuestFarmLookIdle end
+                if type(data.FavouriteFishList) == "table" then
+                    local l = {}
+                    for _, n in ipairs(data.FavouriteFishList) do if type(n) == "string" and n ~= "" then l[#l + 1] = n end end
+                    Config.FavouriteFishList = l
+                end
                 if type(data.IdleSpotOn) == "boolean" then Config.IdleSpotOn = data.IdleSpotOn end
                 if isNames(data.SkillHard) then Config.SkillHard = { data.SkillHard[1], data.SkillHard[2], data.SkillHard[3] } end
                 if type(data.EasyMinAmount) == "number" then Config.EasyMinAmount = math.clamp(math.floor(data.EasyMinAmount), 1, 500) end
@@ -1141,7 +1158,7 @@ end)
 -- Performance saver ------------------------------------------------------------------------
 -- Everything here is reversible: the original values are remembered and restored when a switch is turned off
 -- (or when the script is closed).
-local perf = { black = false, lowgfx = false, nofx = false, mute = false, fps = false, tick = nil }
+local perf = { black = false, lowgfx = false, nofx = false, mute = false, fps = false, hide = false, tick = nil }
 do
     local Lighting = game:GetService("Lighting")
     local saved = setmetatable({}, { __mode = "k" })   -- [instance] = { property = original value }
@@ -1168,8 +1185,62 @@ do
     end
 
     -- low graphics -----------------------------------------------------------------------
-    local function lowGfx(on)
+    -- part pass: no shadow casting, no reflections, decals/textures hidden, simple meshes. Chunked (a weak executor must not freeze),
+    -- new objects are handled as they appear. The original values are kept and restored.
+    local gfxSaved = setmetatable({}, { __mode = "k" })
+    local gfxConn, gfxToken = nil, 0
+    local function lite(d)
+        if gfxSaved[d] then return end
+        if d:IsA("BasePart") then
+            if espFolder and d:IsDescendantOf(espFolder) then return end
+            pcall(function()
+                gfxSaved[d] = { d.CastShadow, d.Reflectance, d:IsA("MeshPart") and d.RenderFidelity or nil }
+                d.CastShadow = false
+                d.Reflectance = 0
+                if d:IsA("MeshPart") then d.RenderFidelity = Enum.RenderFidelity.Performance end
+            end)
+        elseif d:IsA("Decal") then      -- (Texture is a Decal too)
+            setProp(d, "Transparency", 1)
+        end
+    end
+    local function liteAll(on)
+        gfxToken = gfxToken + 1
+        if gfxConn then gfxConn:Disconnect(); gfxConn = nil end
         if on then
+            local token = gfxToken
+            gfxConn = Workspace.DescendantAdded:Connect(lite)
+            task.spawn(function()
+                local n = 0
+                for _, d in ipairs(Workspace:GetDescendants()) do
+                    if token ~= gfxToken or not running then return end
+                    lite(d)
+                    n = n + 1
+                    if n % 1500 == 0 then task.wait() end
+                end
+            end)
+        else
+            for d, v in pairs(gfxSaved) do
+                pcall(function()
+                    d.CastShadow = v[1]; d.Reflectance = v[2]
+                    if v[3] ~= nil then d.RenderFidelity = v[3] end
+                end)
+                gfxSaved[d] = nil
+            end
+            restoreProps(function(i) return i:IsA("Decal") end)
+        end
+    end
+    local function lowGfx(on)
+        -- (the 5 s re-apply must not restart or undo the part pass: only act when the state changes)
+        if on and not g.liteOn then g.liteOn = true; liteAll(true)
+        elseif not on and g.liteOn then g.liteOn = nil; liteAll(false) end
+        if on then
+            pcall(function()
+                local r = settings().Rendering
+                if g.mesh == nil then g.mesh = r.MeshPartDetailLevel end
+                r.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level04
+            end)
+            setProp(Lighting, "EnvironmentSpecularScale", 0)
+            setProp(Lighting, "EnvironmentDiffuseScale", 0)
             pcall(function()
                 local r = settings().Rendering
                 if g.quality == nil then g.quality = r.QualityLevel end
@@ -1199,6 +1270,32 @@ do
                 pcall(function() settings().Rendering.QualityLevel = g.quality end)
                 g.quality = nil
             end
+            if g.mesh ~= nil then
+                pcall(function() settings().Rendering.MeshPartDetailLevel = g.mesh end)
+                g.mesh = nil
+            end
+        end
+    end
+
+    -- other players' characters: not drawn at all (client only). Their skill effects and accessories are a big part of the
+    -- load in a crowded server. Re-applied every few seconds (new players, respawns, new accessories).
+    local function hidePlayers(on)
+        if on then
+            for _, pl in ipairs(Players:GetPlayers()) do
+                local ch = pl ~= lp and pl.Character
+                if ch then
+                    for _, d in ipairs(ch:GetDescendants()) do
+                        if d:IsA("BasePart") then setProp(d, "LocalTransparencyModifier", 1)
+                        elseif d:IsA("Decal") then setProp(d, "Transparency", 1) end
+                    end
+                end
+            end
+        else
+            restoreProps(function(i)
+                if not i:IsA("BasePart") then return false end
+                local m = i:FindFirstAncestorOfClass("Model")
+                return m ~= nil and m ~= lp.Character
+            end)
         end
     end
 
@@ -1341,13 +1438,15 @@ do
     -- public API ---------------------------------------------------------------------------
     function perf.setBlack(on) perf.black = on and true or false; black(perf.black); refreshFps() end
     function perf.setLowGfx(on) perf.lowgfx = on and true or false; lowGfx(perf.lowgfx) end
+    function perf.setHide(on) perf.hide = on and true or false; hidePlayers(perf.hide) end
     function perf.setNoFx(on) perf.nofx = on and true or false; noFx(perf.nofx) end
     function perf.setMute(on) perf.mute = on and true or false; return mute(perf.mute) end
     function perf.setFps(on) perf.fps = on and true or false; return refreshFps() end
     function perf.refreshFps() return refreshFps() end
     function perf.restoreAll()
-        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps = false, false, false, false, false
+        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps, perf.hide = false, false, false, false, false, false
         pcall(black, false)
+        pcall(hidePlayers, false)
         pcall(lowGfx, false)
         pcall(noFx, false)
         pcall(mute, false)
@@ -1361,6 +1460,7 @@ do
         if perf.lowgfx then on[#on + 1] = "low-gfx" end
         if perf.nofx then on[#on + 1] = "no-fx" end
         if perf.mute then on[#on + 1] = "mute" end
+        if perf.hide then on[#on + 1] = "hide-players" end
         if perf.fps then on[#on + 1] = "fps " .. Config.FpsCap end
         return #on > 0 and table.concat(on, ", ") or "all off"
     end
@@ -1369,6 +1469,10 @@ do
         if perf.lowgfx and now - lastReapply >= 5 then
             lastReapply = now
             pcall(lowGfx, true)
+        end
+        if perf.hide and now - (perf.lastHide or 0) >= 4 then
+            perf.lastHide = now
+            pcall(hidePlayers, true)
         end
         if perf.black and Config.BlackHideUi and now - lastUi >= 5 then
             lastUi = now
@@ -2717,13 +2821,13 @@ function ui.makeRowsPanel()
         Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = nextOrder(),
     }, Body)
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }, holder)
-    return function(rows)
+    return function(rows, emptyText)
         for _, c in ipairs(holder:GetChildren()) do
             if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
         end
         if #rows == 0 then
             new("TextLabel", {
-                Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1, BackgroundTransparency = 1, Text = "(no skills equipped right now)",
+                Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1, BackgroundTransparency = 1, Text = emptyText or "(no skills equipped right now)",
                 TextColor3 = Color3.fromRGB(150, 150, 150), Font = Enum.Font.Gotham, TextSize = 10,
             }, holder)
         end
@@ -3147,9 +3251,42 @@ toggleButton("Auto favourite fish", 28, Config.AutoFavourite, function(v)
     Config.AutoFavourite = v
 end)
 ui.sub("Options")
-makeDropdown("Target fish", FISH_LIST, Config.FavouriteFishName, function(name)
-    Config.FavouriteFishName = name
-end)
+do
+    -- fish names found in YOUR inventory right now (new fish that are not in any list show up here) + the built-in list,
+    -- minus the ones that are already locked
+    local function fishChoices()
+        local seen, out = {}, {}
+        local function add(n)
+            if type(n) == "string" and n ~= "" and not seen[n] and not Config.FavHas(n) then seen[n] = true; out[#out + 1] = n end
+        end
+        pcall(function()
+            local inv = getData():FindFirstChild("Inventory")
+            if inv then for _, it in ipairs(inv:GetChildren()) do add(Config.FishBase(it.Name)) end end
+        end)
+        local mine = #out
+        for _, n in ipairs(FISH_LIST) do add(n) end
+        table.sort(out, function(a, b) return a < b end)
+        return out
+    end
+    local setRows
+    local function showList()
+        local rows = {}
+        for i, n in ipairs(Config.FavouriteFishList) do
+            rows[#rows + 1] = { text = "🔒 " .. n .. "   (tap to remove)", color = COL_GREEN, on = function()
+                table.remove(Config.FavouriteFishList, i)
+                markDirty(); saveSettings(); showList()
+            end }
+        end
+        setRows(rows, "(no fish locked - pick one below)")
+    end
+    setRows = ui.makeRowsPanel()
+    showList()
+    makeSearchPicker("Add fish to lock (from my inventory)", fishChoices, function() return "" end, function(name)
+        if name == "" or Config.FavHas(name) then return end
+        Config.FavouriteFishList[#Config.FavouriteFishList + 1] = name
+        markDirty(); saveSettings(); showList()
+    end)
+end
 ui.endSub()
 toggleButton("Material farming", 28, Config.MaterialFarming, function(v)
     play(clickSound)
@@ -5392,13 +5529,17 @@ do
         play(clickSound)
         perf.setFps(v)
     end)
-    perf.vis = { lowgfx = v1, nofx = v2, mute = v3, fps = v4 }
+    local _, v5 = toggleButton("Hide other players (their skills/effects cost a lot)", 30, false, function(v)
+        play(clickSound)
+        perf.setHide(v)
+    end)
+    perf.vis = { lowgfx = v1, nofx = v2, mute = v3, fps = v4, hide = v5 }
 end
 actionButton("Max saver (everything on)", 34, function()
     play(clickSound)
     perf.setBlack(true); if ui.setBlack then ui.setBlack(true) end
-    perf.setLowGfx(true); perf.setNoFx(true); perf.setMute(true); perf.setFps(true)
-    for _, k in ipairs({ "lowgfx", "nofx", "mute", "fps" }) do
+    perf.setLowGfx(true); perf.setNoFx(true); perf.setMute(true); perf.setFps(true); perf.setHide(true)
+    for _, k in ipairs({ "lowgfx", "nofx", "mute", "fps", "hide" }) do
         if perf.vis[k] then pcall(perf.vis[k], true) end
     end
 end)
