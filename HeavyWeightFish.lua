@@ -2335,16 +2335,16 @@ end
 ---------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------
-local COL_CARD = Color3.fromRGB(20, 23, 31)
-local COL_ROW = Color3.fromRGB(30, 34, 46)
-local COL_STROKE = Color3.fromRGB(44, 50, 66)
-local COL_GREEN = Color3.fromRGB(0, 255, 150)
-local COL_ON = Color3.fromRGB(0, 190, 105)
-local COL_OFF = Color3.fromRGB(66, 70, 88)
+local COL_CARD = Color3.fromRGB(34, 34, 36)      -- cards
+local COL_ROW = Color3.fromRGB(46, 46, 49)       -- buttons / rows inside cards
+local COL_STROKE = Color3.fromRGB(44, 44, 46)
+local COL_GREEN = Color3.fromRGB(46, 154, 255)   -- accent (kept under the old name): blue
+local COL_ON = Color3.fromRGB(48, 209, 88)       -- switch on: green
+local COL_OFF = Color3.fromRGB(72, 72, 76)
 local COL_RED = Color3.fromRGB(200, 60, 60)
-local COL_TEXT2 = Color3.fromRGB(140, 148, 165)
-local COL_TABON = Color3.fromRGB(30, 34, 46)
-local COL_TABOFF = Color3.fromRGB(14, 16, 22)
+local COL_TEXT2 = Color3.fromRGB(150, 150, 156)
+local COL_TABON = Color3.fromRGB(38, 38, 40)
+local COL_TABOFF = Color3.fromRGB(17, 17, 18)
 
 local function new(class, props, parent)
     local inst = Instance.new(class)
@@ -2421,58 +2421,68 @@ function ui.fitSize()
     local cam = workspace.CurrentCamera
     local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
     local mobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-    local w = math.clamp(vp.X - 24, 290, 390)
-    local h = math.clamp(vp.Y - (mobile and 30 or 60), 250, 590)
-    return UDim2.new(0, w, 0, h), UDim2.new(0, w, 0, 46), mobile, h
+    local w = math.clamp(vp.X - 24, 330, 620)
+    local h = math.clamp(vp.Y - (mobile and 30 or 60), 260, 470)
+    ui.sbW = (w < 500) and 78 or 124          -- sidebar width (narrower on a phone)
+    return UDim2.new(0, w, 0, h), UDim2.new(0, w, 0, 60), mobile, h
 end
 local FULL_SIZE, MIN_SIZE = ui.fitSize()
 
 local Main = new("Frame", {
     Size = FULL_SIZE, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
-    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ClipsDescendants = true,
+    BackgroundColor3 = Color3.fromRGB(17, 17, 18), BorderSizePixel = 0, ClipsDescendants = true,
 }, sg)
-corner(Main, 12)
-new("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(19, 22, 31), Color3.fromRGB(10, 11, 15)), Rotation = 90 }, Main)
-new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, Main)
+corner(Main, 20)
+new("UIStroke", { Color = Color3.fromRGB(40, 40, 42), Thickness = 1 }, Main)
 
-local TitleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundTransparency = 1 }, Main)
-new("TextLabel", {
-    Size = UDim2.new(1, -122, 1, 0), Position = UDim2.new(0, 14, 0, 0), BackgroundTransparency = 1,
-    Text = "PPINGYYY  Auto Fish", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, TitleBar)
+local TitleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 60), BackgroundTransparency = 1 }, Main)
+do   -- logo + title + subtitle
+    local logo = new("Frame", { Size = UDim2.new(0, 34, 0, 34), Position = UDim2.new(0, 16, 0, 13), BackgroundColor3 = COL_ROW, BorderSizePixel = 0 }, TitleBar)
+    corner(logo, 17)
+    local ring = new("Frame", {
+        Size = UDim2.new(0, 14, 0, 14), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundTransparency = 1,
+    }, logo)
+    corner(ring, 7)
+    new("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2.5 }, ring)
+    new("TextLabel", {
+        Size = UDim2.new(1, -230, 0, 20), Position = UDim2.new(0, 60, 0, 11), BackgroundTransparency = 1,
+        Text = "PPINGYYY", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 15,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, TitleBar)
+    new("TextLabel", {
+        Size = UDim2.new(1, -230, 0, 16), Position = UDim2.new(0, 60, 0, 31), BackgroundTransparency = 1,
+        Text = "Heavyweight Fishing  -  Auto Fish", TextColor3 = COL_TEXT2, Font = Enum.Font.Gotham, TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, TitleBar)
+end
 
-local CloseBtn = new("TextButton", {
-    Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -38, 0, 10), Text = "✕", Font = Enum.Font.GothamBold,
-    TextSize = 12, BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, AutoButtonColor = true,
-}, TitleBar)
-corner(CloseBtn, 6)
-
-local MinBtn = new("TextButton", {
-    Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -70, 0, 10), Text = "—", Font = Enum.Font.GothamBold,
-    TextSize = 12, BackgroundColor3 = COL_ROW, TextColor3 = COL_TEXT2, AutoButtonColor = true,
-}, TitleBar)
-corner(MinBtn, 6)
+function ui.titleBtn(text, x, color)
+    local b = new("TextButton", {
+        Size = UDim2.new(0, 30, 0, 30), Position = UDim2.new(1, x, 0, 15), Text = text, Font = Enum.Font.GothamBold,
+        TextSize = 16, BackgroundTransparency = 1, TextColor3 = color or Color3.fromRGB(200, 200, 205), AutoButtonColor = false,
+    }, TitleBar)
+    return b
+end
+local CloseBtn = ui.titleBtn("✕", -42)
+local MinBtn = ui.titleBtn("—", -74)
 
 do
-    local HelpBtn = new("TextButton", {
-        Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -102, 0, 10), Text = "?", Font = Enum.Font.GothamBold,
-        TextSize = 13, BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, AutoButtonColor = true,
-    }, TitleBar)
-    corner(HelpBtn, 6)
+    local HelpBtn = ui.titleBtn("?", -106, COL_GREEN)
     HelpBtn.MouseButton1Click:Connect(function()
         play(clickSound)
         if ui.toggleHelp then ui.toggleHelp() end
     end)
 end
 
--- content area: tab bar + one scrolling page per tab ---------------------------------------
+-- layout: sidebar with the tabs on the left, a rounded panel (pages + status line) on the right ---------------
 local Content = new("Frame", {
-    Size = UDim2.new(1, 0, 1, -160), Position = UDim2.new(0, 0, 0, 46), BackgroundTransparency = 1,
+    Size = UDim2.new(1, -140, 1, -70), Position = UDim2.new(0, 130, 0, 60), BackgroundColor3 = Color3.fromRGB(26, 26, 27), BorderSizePixel = 0,   -- right-hand content panel
+    ClipsDescendants = true,
 }, Main)
-local TabBar = new("Frame", { Size = UDim2.new(1, -20, 0, 32), Position = UDim2.new(0, 10, 0, 2), BackgroundTransparency = 1 }, Content)
-new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, TabBar)
-local Pages = new("Frame", { Size = UDim2.new(1, 0, 1, -38), Position = UDim2.new(0, 0, 0, 38), BackgroundTransparency = 1 }, Content)
+corner(Content, 16)
+local TabBar = new("Frame", { Size = UDim2.new(0, 120, 1, -94), Position = UDim2.new(0, 10, 0, 60), BackgroundTransparency = 1 }, Main)
+new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, TabBar)
+local Pages = new("Frame", { Size = UDim2.new(1, 0, 1, -64), Position = UDim2.new(0, 0, 0, 4), BackgroundTransparency = 1 }, Content)
 
 local pages, tabButtons = {}, {}
 local Body = nil     -- the container the widget helpers below put their controls into (a card)
@@ -2489,7 +2499,7 @@ local function selectTab(name)
     for n, tb in pairs(tabButtons) do
         local on = (n == name)
         TweenService:Create(tb.btn, TweenInfo.new(0.15), {
-            BackgroundColor3 = on and COL_TABON or COL_TABOFF, TextColor3 = on and COL_GREEN or COL_TEXT2,
+            BackgroundColor3 = on and COL_TABON or COL_TABOFF, TextColor3 = on and Color3.new(1, 1, 1) or COL_TEXT2,
         }):Play()
         tb.line.Visible = on
     end
@@ -2497,15 +2507,17 @@ end
 
 local function addTab(name, label, order)
     local btn = new("TextButton", {
-        Size = UDim2.new(1 / 6, -3.4, 1, 0), LayoutOrder = order, Text = label, Font = Enum.Font.GothamBold, TextSize = 11,
+        Size = UDim2.new(1, 0, 0, 38), LayoutOrder = order, Text = label, Font = Enum.Font.GothamMedium, TextSize = 13,
         BackgroundColor3 = COL_TABOFF, TextColor3 = COL_TEXT2, BorderSizePixel = 0, AutoButtonColor = false,
+        TextXAlignment = Enum.TextXAlignment.Left,
     }, TabBar)
-    corner(btn, 7)
+    corner(btn, 12)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 16) }, btn)
     local line = new("Frame", {
-        Size = UDim2.new(1, -16, 0, 2), Position = UDim2.new(0, 8, 1, -4), BackgroundColor3 = COL_GREEN,
-        BorderSizePixel = 0, Visible = false, BackgroundTransparency = 1,
+        Size = UDim2.new(0, 3, 0, 16), Position = UDim2.new(0, -11, 0.5, -8), BackgroundColor3 = COL_GREEN,
+        BorderSizePixel = 0, Visible = false,
     }, btn)
-    corner(line, 1)
+    corner(line, 2)
     local page = new("ScrollingFrame", {
         Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
         ScrollBarImageColor3 = COL_GREEN, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -2541,15 +2553,15 @@ local function section(text)
         Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = COL_CARD,
         BorderSizePixel = 0, LayoutOrder = nextOrder(),
     }, Page)
-    corner(card, 10)
+    corner(card, 16)
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, card)
     new("UIPadding", {
-        PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+        PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
     }, card)
     text = string.gsub(text, "^[^%w]+", "")     -- plain title, no emoji
     new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = string.upper(text), LayoutOrder = nextOrder(),
-        TextColor3 = COL_TEXT2, Font = Enum.Font.GothamBold, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+        Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, Text = text, LayoutOrder = nextOrder(),
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
     }, card)
     Body = card
     return card
@@ -2559,24 +2571,24 @@ end
 local function toggleButton(label, h, initial, onChange)
     local state = initial and true or false
     local row = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 30), LayoutOrder = nextOrder(), BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 34), LayoutOrder = nextOrder(), BackgroundTransparency = 1,
         BorderSizePixel = 0, Text = "", AutoButtonColor = false,
     }, Body)
     new("TextLabel", {
         Size = UDim2.new(1, -62, 1, 0), Position = UDim2.new(0, 2, 0, 0), BackgroundTransparency = 1, Text = label,
-        TextColor3 = Color3.fromRGB(230, 233, 240), Font = Enum.Font.Gotham, TextSize = 12, TextWrapped = true,
+        TextColor3 = Color3.fromRGB(240, 240, 244), Font = Enum.Font.GothamMedium, TextSize = 12, TextWrapped = true,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, row)
     local pill = new("Frame", {
-        Size = UDim2.new(0, 38, 0, 20), Position = UDim2.new(1, -40, 0.5, -10), BackgroundColor3 = COL_OFF, BorderSizePixel = 0,
+        Size = UDim2.new(0, 46, 0, 26), Position = UDim2.new(1, -48, 0.5, -13), BackgroundColor3 = COL_OFF, BorderSizePixel = 0,
     }, row)
-    corner(pill, 10)
+    corner(pill, 13)
     local knob = new("Frame", {
-        Size = UDim2.new(0, 16, 0, 16), Position = UDim2.new(0, 2, 0.5, -8), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+        Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(0, 2, 0.5, -11), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
     }, pill)
-    corner(knob, 8)
+    corner(knob, 11)
     local function refresh(animate)
-        local pos = state and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+        local pos = state and UDim2.new(1, -24, 0.5, -11) or UDim2.new(0, 2, 0.5, -11)
         local col = state and COL_ON or COL_OFF
         if animate then
             TweenService:Create(knob, TweenInfo.new(0.12), { Position = pos }):Play()
@@ -2601,10 +2613,10 @@ end
 local function actionButton(text, h, onClick)
     text = string.gsub(text, "^[^%w]+", "")
     local btn = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 28), LayoutOrder = nextOrder(), Font = Enum.Font.GothamMedium, TextSize = 11,
-        Text = text, BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 34), LayoutOrder = nextOrder(), Font = Enum.Font.GothamMedium, TextSize = 12,
+        Text = text, BackgroundColor3 = COL_ROW, TextColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
     }, Body)
-    corner(btn, 7)
+    corner(btn, 17)
     btn.MouseButton1Click:Connect(onClick)
     return btn
 end
@@ -2631,9 +2643,9 @@ local function makeSlider(title, unit, vmin, vmax, snap, btnStep, decimals, init
     local function stepBtn(text, pos)
         local b = new("TextButton", {
             Size = UDim2.new(0, 26, 0, 22), Position = pos, Text = text, Font = Enum.Font.GothamBold,
-            TextSize = 14, BackgroundColor3 = COL_ROW, TextColor3 = COL_GREEN, BorderSizePixel = 0,
+            TextSize = 14, BackgroundColor3 = COL_ROW, TextColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
         }, box)
-        corner(b, 5)
+        corner(b, 11)
         return b
     end
     local minus = stepBtn("-", UDim2.new(0, 2, 0, 24))
@@ -2641,16 +2653,16 @@ local function makeSlider(title, unit, vmin, vmax, snap, btnStep, decimals, init
 
     local hit = new("Frame", { Size = UDim2.new(1, -86, 0, 24), Position = UDim2.new(0, 43, 0, 23), BackgroundTransparency = 1 }, box)
     local track = new("Frame", {
-        Size = UDim2.new(1, 0, 0, 6), Position = UDim2.new(0, 0, 0.5, -3), BackgroundColor3 = Color3.fromRGB(45, 45, 50), BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 6), Position = UDim2.new(0, 0, 0.5, -3), BackgroundColor3 = Color3.fromRGB(62, 62, 66), BorderSizePixel = 0,
     }, hit)
     corner(track, 3)
-    local fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = COL_GREEN, BorderSizePixel = 0 }, track)
+    local fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(10, 132, 255), BorderSizePixel = 0 }, track)
     corner(fill, 3)
     local knob = new("Frame", {
-        Size = UDim2.new(0, 14, 0, 14), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.new(0, 26, 0, 16), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0),
         BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2,
     }, track)
-    corner(knob, 7)
+    corner(knob, 8)
 
     local fmt = "%." .. decimals .. "f %s"
     local scale = 10 ^ decimals
@@ -2718,7 +2730,7 @@ local function makeDropdown(title, options, initial, onPick)
         btn.Text = title .. ":  " .. tostring(selected) .. (list.Visible and "   ▴" or "   ▾")
         for name, b in pairs(optionButtons) do
             b.TextColor3 = (name == selected) and COL_GREEN or Color3.new(1, 1, 1)
-            b.BackgroundColor3 = (name == selected) and Color3.fromRGB(0, 70, 45) or COL_ROW
+            b.BackgroundColor3 = (name == selected) and Color3.fromRGB(14, 62, 118) or COL_ROW
         end
     end
     for i, name in ipairs(options) do
@@ -2791,7 +2803,7 @@ local function makeSearchPicker(title, getOptions, getValue, onPick)
                 n = n + 1
                 local ob = new("TextButton", {
                     Size = UDim2.new(1, -4, 0, 22), LayoutOrder = n, Text = (name == "") and "(none)" or name, Font = Enum.Font.Gotham,
-                    TextSize = 10, BackgroundColor3 = (name == cur) and Color3.fromRGB(0, 70, 45) or COL_ROW,
+                    TextSize = 10, BackgroundColor3 = (name == cur) and Color3.fromRGB(14, 62, 118) or COL_ROW,
                     TextColor3 = (name == cur) and COL_GREEN or Color3.new(1, 1, 1), BorderSizePixel = 0,
                 }, list)
                 corner(ob, 4)
@@ -5554,9 +5566,9 @@ end
 
 -- status (always visible at the bottom) ------------------------------
 local StatusBox = new("Frame", {
-    Size = UDim2.new(1, -20, 0, 66), Position = UDim2.new(0, 10, 1, -106), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
-}, Main)
-corner(StatusBox, 10)
+    Size = UDim2.new(1, -16, 0, 56), Position = UDim2.new(0, 8, 1, -64), BackgroundColor3 = COL_CARD, BorderSizePixel = 0,
+}, Content)
+corner(StatusBox, 14)
 local StatusLabel = new("TextLabel", {
     Size = UDim2.new(1, -16, 0, 34), Position = UDim2.new(0, 8, 0, 4), BackgroundTransparency = 1, Text = "Status: ...",
     TextColor3 = COL_GREEN, Font = Enum.Font.GothamBold, TextSize = 11, TextWrapped = true,
@@ -5571,11 +5583,16 @@ local DetailLabel = new("TextLabel", {
 -- dragging ----------------------------------------------------------
 -- a "move" handle along the bottom of the expanded window (the title bar drags too)
 local MoveBtn = new("TextButton", {
-    Size = UDim2.new(1, -20, 0, 24), Position = UDim2.new(0, 10, 1, -32), Text = "Drag here to move",
-    Font = Enum.Font.Gotham, TextSize = 10, BackgroundColor3 = COL_CARD, TextColor3 = COL_TEXT2,
-    AutoButtonColor = false,
+    Size = UDim2.new(0, 120, 0, 22), Position = UDim2.new(0, 10, 1, -30), Text = "",
+    BackgroundTransparency = 1, AutoButtonColor = false,
 }, Main)
-corner(MoveBtn, 8)
+do   -- a small pill as the grip (drag here or by the title bar)
+    local grip = new("Frame", {
+        Size = UDim2.new(0, 56, 0, 5), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+        BackgroundColor3 = Color3.fromRGB(70, 70, 74), BorderSizePixel = 0,
+    }, MoveBtn)
+    corner(grip, 3)
+end
 do
     local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
     for _, handle in ipairs({ TitleBar, MoveBtn }) do
@@ -5614,7 +5631,7 @@ do
         ui.helpGui = helpGui
         local win = new("Frame", {
             Size = UDim2.new(0, 340, 0, 400), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
-            BackgroundColor3 = Color3.fromRGB(16, 18, 26), BorderSizePixel = 0, Active = true,
+            BackgroundColor3 = Color3.fromRGB(20, 20, 22), BorderSizePixel = 0, Active = true,
         }, helpGui)
         corner(win, 12)
         new("UIStroke", { Color = COL_STROKE, Thickness = 1 }, win)
@@ -5696,12 +5713,18 @@ do
         FULL_SIZE, MIN_SIZE = full, min
         local compact = h < 430            -- short screen (phone in landscape, small window): drop the extras
         ui.compact = compact
-        Content.Size = UDim2.new(1, 0, 1, compact and -100 or -160)
-        StatusBox.Size = UDim2.new(1, -20, 0, compact and 38 or 66)
-        StatusBox.Position = UDim2.new(0, 10, 1, compact and -46 or -106)
+        local sb = ui.sbW or 124
+        local sh = compact and 38 or 58
+        TabBar.Size = UDim2.new(0, sb, 1, -94)
+        MoveBtn.Size = UDim2.new(0, sb, 0, 22)
+        Content.Position = UDim2.new(0, sb + 20, 0, 60)
+        Content.Size = UDim2.new(1, -(sb + 30), 1, -70)
+        Pages.Size = UDim2.new(1, 0, 1, -(sh + 14))
+        StatusBox.Size = UDim2.new(1, -16, 0, sh)
+        StatusBox.Position = UDim2.new(0, 8, 1, -(sh + 8))
         StatusLabel.Size = UDim2.new(1, -16, 0, compact and 30 or 34)
         DetailLabel.Visible = not compact
-        MoveBtn.Visible = (not compact) and not minimized
+        MoveBtn.Visible = not minimized
         Main.Size = minimized and MIN_SIZE or FULL_SIZE
     end
     applyFit()
@@ -5717,6 +5740,7 @@ MinBtn.MouseButton1Click:Connect(function()
     minimized = not minimized
     if minimized then
         Content.Visible = false
+        TabBar.Visible = false
         StatusBox.Visible = false
         MoveBtn.Visible = false
         TweenService:Create(Main, TweenInfo.new(0.2), { Size = MIN_SIZE }):Play()
@@ -5726,8 +5750,9 @@ MinBtn.MouseButton1Click:Connect(function()
         task.delay(0.2, function()
             if running and not minimized then
                 Content.Visible = true
+                TabBar.Visible = true
                 StatusBox.Visible = true
-                MoveBtn.Visible = not ui.compact
+                MoveBtn.Visible = true
             end
         end)
         MinBtn.Text = "—"
