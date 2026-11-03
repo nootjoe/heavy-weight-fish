@@ -3402,6 +3402,191 @@ end
 
 -- tab: Misc ----------------------------------------------------------
 setPage("Misc")
+-- 🌦️ Server hop: join other servers until the wanted weather is there -------------------------------------
+-- The weather is set by the server (Workspace attribute "Weather") and nothing about it is visible from outside, so the only
+-- way to find it is to join a server and look. The server list comes from the public Roblox servers API (needs the executor's
+-- request function); after each teleport the script is started again with queue_on_teleport (needs the script file in the
+-- executor's workspace folder, see HOP_SCRIPT_FILE, or the autoexec folder).
+function ui.buildHop()   -- (a function of its own: the main chunk is at its limit of local variables)
+    local WEATHERS = { "Blazing Sun", "Blood", "Clear", "Foggy", "Rainy", "Snowy", "Thunderstorm", "Windy" }
+    local HOP_FILE = "PPINGYYY_hop.json"
+    local HOP_SCRIPT_FILE = env.PP_ScriptFile or "HeavyWeightFish_merged.lua"
+    local TeleportService = game:GetService("TeleportService")
+    local hop = { on = false, targets = {}, visited = {}, hops = 0, stopOnFound = true }
+    local setStatus, setMaster = function() end, nil
+    local busy, queued, lastFound = false, false, nil
+
+    local function save()
+        if not writefile then return end
+        pcall(function()
+            writefile(HOP_FILE, HttpService:JSONEncode({
+                on = hop.on, targets = hop.targets, visited = hop.visited, hops = hop.hops, stopOnFound = hop.stopOnFound,
+            }))
+        end)
+    end
+    pcall(function()
+        if isfile and readfile and isfile(HOP_FILE) then
+            local d = HttpService:JSONDecode(readfile(HOP_FILE))
+            if type(d) == "table" then
+                hop.on = d.on == true
+                if type(d.targets) == "table" then
+                    for k, v in pairs(d.targets) do if type(k) == "string" and v == true then hop.targets[k] = true end end
+                end
+                if type(d.visited) == "table" then
+                    for k, v in pairs(d.visited) do if type(k) == "string" and type(v) == "number" then hop.visited[k] = v end end
+                end
+                if type(d.hops) == "number" then hop.hops = d.hops end
+                if d.stopOnFound == false then hop.stopOnFound = false end
+            end
+        end
+    end)
+
+    local function targetList()
+        local l = {}
+        for _, w in ipairs(WEATHERS) do if hop.targets[w] then l[#l + 1] = w end end
+        return l
+    end
+
+    -- one random public server we have not been in lately; returns id, or nil + reason + seconds to wait
+    local function pickServer()
+        local req = getHttpRequest()
+        if not req then return nil, "this executor has no request function", 60 end
+        local now = os.time()
+        for id, t in pairs(hop.visited) do if now - t > 900 then hop.visited[id] = nil end end   -- forget after 15 min
+        local cands, cursor = {}, nil
+        for _ = 1, 3 do
+            local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
+            if cursor then url = url .. "&cursor=" .. cursor end
+            local ok, resp = pcall(req, { Url = url, Method = "GET" })
+            if not ok or type(resp) ~= "table" then return nil, "server list request failed", 15 end
+            local code = resp.StatusCode or resp.status_code
+            if code == 429 then return nil, "server list rate limited, waiting", 30 end
+            local ok2, data = pcall(function() return HttpService:JSONDecode(resp.Body or "") end)
+            if not ok2 or type(data) ~= "table" or type(data.data) ~= "table" then return nil, "server list unreadable (HTTP " .. tostring(code) .. ")", 15 end
+            for _, sv in ipairs(data.data) do
+                if type(sv) == "table" and sv.id and sv.id ~= game.JobId and not hop.visited[sv.id]
+                    and type(sv.playing) == "number" and type(sv.maxPlayers) == "number" and sv.playing < sv.maxPlayers - 1 then
+                    cands[#cands + 1] = sv.id
+                end
+            end
+            cursor = data.nextPageCursor
+            if type(cursor) ~= "string" or #cands >= 60 then break end
+        end
+        if #cands == 0 then return nil, "no fresh server found, waiting", 20 end
+        return cands[math.random(1, #cands)]
+    end
+
+    local function hopNow()
+        local id, why, wait = pickServer()
+        if not id then setStatus(why); return wait or 15 end
+        if queue_on_teleport and not queued then
+            queued = true
+            local code = string.format('task.wait(3) local f = %q if isfile and isfile(f) then loadstring(readfile(f))() end', HOP_SCRIPT_FILE)
+            pcall(queue_on_teleport, code)
+        end
+        hop.visited[id] = os.time()
+        hop.hops = hop.hops + 1
+        save()
+        setStatus("hopping (#" .. hop.hops .. ")...")
+        local ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, id, lp) end)
+        if not ok then setStatus("teleport failed: " .. tostring(err)); return 10 end
+        return 12     -- give the teleport time; if it did not happen (full server ...) the loop tries the next one
+    end
+
+    conns[#conns + 1] = TeleportService.TeleportInitFailed:Connect(function(_, result, msg)
+        if hop.on then setStatus("teleport refused (" .. tostring(result) .. "), next server") end
+    end)
+
+    task.spawn(function()
+        task.wait(4)
+        while running do
+            task.wait(2)
+            if hop.on and not busy then
+                busy = true
+                local list = targetList()
+                if #list == 0 then
+                    setStatus("pick at least one weather")
+                else
+                    local w = nil
+                    local e = tick() + 25
+                    while running and not w and tick() < e do
+                        local a = workspace:GetAttribute("Weather")
+                        if a then w = tostring(a) else task.wait(0.5) end
+                    end
+                    if not running then return end
+                    if not w then
+                        setStatus("weather not readable here, hopping")
+                        task.wait(hopNow())
+                    elseif hop.targets[w] then
+                        setStatus("FOUND: " .. w .. "  (hops: " .. hop.hops .. ")")
+                        if lastFound ~= w then
+                            lastFound = w
+                            play(skillSound)
+                            pcall(function()
+                                StarterGui:SetCore("SendNotification", { Title = "Weather found!", Text = w .. " in this server (after " .. hop.hops .. " hops)", Duration = 10 })
+                            end)
+                        end
+                        if hop.stopOnFound then
+                            hop.on = false
+                            save()
+                            if setMaster then setMaster(false) end
+                        end
+                    else
+                        lastFound = nil
+                        setStatus("now: " .. w .. "  - not wanted, hopping")
+                        task.wait(hopNow())
+                    end
+                end
+                busy = false
+            end
+        end
+    end)
+
+    section("Server hop (find a weather)")
+    local info = infoCard({ { "state", "Status" } }, 0.2)
+    setStatus = function(t) info.state(tostring(t)) end
+    local _, sm = toggleButton("Hop until the weather below is found", 34, hop.on, function(v)
+        play(clickSound)
+        hop.on = v
+        lastFound = nil
+        if v then
+            if not (isfile and isfile(HOP_SCRIPT_FILE)) then
+                setStatus("save this script as '" .. HOP_SCRIPT_FILE .. "' in your executor workspace (or autoexec) so it restarts after each hop")
+            elseif #targetList() == 0 then
+                setStatus("pick at least one weather")
+            else
+                setStatus("starting...")
+            end
+        else
+            setStatus("off")
+        end
+        save()
+    end)
+    setMaster = sm
+    setStatus(hop.on and "resuming..." or "off")
+    toggleButton("Stop when found (off = stay while it lasts, hop again when it ends)", 34, hop.stopOnFound, function(v)
+        play(clickSound)
+        hop.stopOnFound = v
+        save()
+    end)
+    actionButton("Hop to another server now", 32, function()
+        play(clickSound)
+        if busy then return end
+        busy = true
+        task.spawn(function() task.wait(hopNow()); busy = false end)
+    end)
+    ui.sub("Wanted weather")
+    for _, w in ipairs(WEATHERS) do
+        toggleButton(w, 30, hop.targets[w] == true, function(v)
+            play(clickSound)
+            hop.targets[w] = v or nil
+            save()
+        end)
+    end
+    ui.endSub()
+end
+ui.buildHop()
+
 -- 🛡️ Anti AFK ----------------------------------------------------------
 section("Anti-AFK")
 toggleButton("Anti-AFK", 28, Config.AntiAFK, function(v)
@@ -5895,138 +6080,183 @@ local function playIntro()
         end
     end)
 
-    -- title: every letter rises out of a mask ---------------------------------
-    local title = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.45, 0), Size = UDim2.new(1, 0, 0, titleH),
-        BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 5,
+    -- the polar bear: drawn from simple shapes (no image download needed), sunglasses on --------------------------
+    local S = math.clamp(math.floor(math.min(vp.X * 0.55, vp.Y * 0.46)), 150, 320)
+    local CY = 0.42
+    local DARK = Color3.fromRGB(10, 14, 24)
+    local center = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, CY, 0), Size = UDim2.new(0, 0, 0, 0), BackgroundTransparency = 1,
     }, content)
-    local titleScale = new("UIScale", { Scale = 0.92 }, title)
-    local row = new("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1 }, title)
-    new("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
-        VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2),
-    }, row)
-
-    local letters = {}
-    local count = 0
-    for i = 1, #INTRO_TEXT do
-        local ch = string.sub(INTRO_TEXT, i, i)
-        local w
-        if ch == " " then
-            w = math.floor(titleSize * 0.38)
-        else
-            local ok, sz = pcall(function()
-                return game:GetService("TextService"):GetTextSize(ch, titleSize, Enum.Font.GothamBlack, Vector2.new(1000, 1000))
-            end)
-            w = ((ok and sz) and sz.X or math.floor(titleSize * 0.7)) + 2
-        end
-        local slot = new("Frame", { Size = UDim2.new(0, w, 1, 0), BackgroundTransparency = 1, LayoutOrder = i }, row)
-        if ch ~= " " then
-            local lbl = new("TextLabel", {
-                Size = UDim2.new(1, 0, 1, 0), Position = UDim2.new(0, 0, 1.1, 0), BackgroundTransparency = 1, Text = ch,
-                Font = Enum.Font.GothamBlack, TextSize = titleSize, TextColor3 = (i <= 4) and ICE or Color3.new(1, 1, 1),
-                TextTransparency = 1,
-            }, slot)
-            local stroke = new("UIStroke", { Color = ICE, Thickness = 2, Transparency = 1 }, lbl)
-            count = count + 1
-            letters[count] = { lbl = lbl, stroke = stroke }
-        end
+    local bear = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, S, 0, S), BackgroundTransparency = 1, ZIndex = 6,
+    }, center)
+    local bearScale = new("UIScale", { Scale = 0 }, bear)
+    local function shape(parent, cx, cy, w, h, color, rad, rot, z)
+        local f = new("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(cx, 0, cy, 0), Size = UDim2.new(w, 0, h, 0),
+            BackgroundColor3 = color, BorderSizePixel = 0, Rotation = rot or 0, ZIndex = z or 6,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(rad or 0, 0) }, f)
+        return f
     end
-    for idx, l in ipairs(letters) do
-        task.delay(0.35 + idx * 0.07, function()
-            if not running then return end
-            TweenService:Create(l.lbl, TweenInfo.new(0.55, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-                Position = UDim2.new(0, 0, 0, 0), TextTransparency = 0,
-            }):Play()
-            TweenService:Create(l.stroke, TweenInfo.new(0.55), { Transparency = 0.45 }):Play()
-        end)
+    local glow = shape(bear, 0.5, 0.52, 1.4, 1.4, ICE, 0.5, 0, 5)
+    glow.BackgroundTransparency = 0.84
+    for _, x in ipairs({ 0.2, 0.8 }) do                                           -- ears
+        local ear = shape(bear, x, 0.2, 0.27, 0.27, SNOW, 0.5, 0, 6)
+        new("UIStroke", { Color = ICE, Thickness = 3 }, ear)
+        shape(bear, x, 0.21, 0.13, 0.13, Color3.fromRGB(125, 180, 212), 0.5, 0, 7)
     end
-    TweenService:Create(titleScale, TweenInfo.new(1.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+    local head = shape(bear, 0.5, 0.54, 0.8, 0.74, SNOW, 0.5, 0, 8)                -- head
+    new("UIStroke", { Color = ICE, Thickness = 3 }, head)
+    new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(196, 222, 242)) }, head)
+    local muzzle = shape(bear, 0.5, 0.7, 0.38, 0.28, Color3.fromRGB(228, 240, 250), 0.5, 0, 9)
+    new("UIStroke", { Color = Color3.fromRGB(170, 205, 228), Thickness = 1.5 }, muzzle)
+    shape(bear, 0.5, 0.625, 0.14, 0.085, DARK, 0.5, 0, 10)                         -- nose
+    local shine = shape(bear, 0.465, 0.61, 0.04, 0.02, Color3.new(1, 1, 1), 0.5, 0, 11)
+    shine.BackgroundTransparency = 0.3
+    shape(bear, 0.5, 0.69, 0.014, 0.05, DARK, 0.5, 0, 10)                          -- mouth
+    shape(bear, 0.462, 0.727, 0.07, 0.016, DARK, 0.5, 24, 10)
+    shape(bear, 0.538, 0.727, 0.07, 0.016, DARK, 0.5, -24, 10)
+    shape(bear, 0.17, 0.46, 0.1, 0.028, DARK, 0.5, -8, 9)                          -- sunglasses: arms, bridge, lenses
+    shape(bear, 0.83, 0.46, 0.1, 0.028, DARK, 0.5, 8, 9)
+    shape(bear, 0.5, 0.45, 0.1, 0.03, DARK, 0.5, 0, 10)
+    for _, x in ipairs({ 0.335, 0.665 }) do
+        local lens = shape(bear, x, 0.48, 0.25, 0.15, DARK, 0.4, 0, 10)
+        new("UIStroke", { Color = ICE, Thickness = 2 }, lens)
+        new("UIGradient", { Rotation = 35, Color = ColorSequence.new(DARK, Color3.fromRGB(0, 130, 185)) }, lens)
+        local g1 = shape(lens, 0.3, 0.5, 0.08, 0.8, Color3.new(1, 1, 1), 0.4, 20, 11)
+        g1.BackgroundTransparency = 0.55
+        local g2 = shape(lens, 0.46, 0.5, 0.03, 0.8, Color3.new(1, 1, 1), 0.4, 20, 11)
+        g2.BackgroundTransparency = 0.7
+    end
 
-    -- shine sweeping across the finished title ----------------------------------
-    local shine = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, -titleSize, 0.5, 0),
-        Size = UDim2.new(0, math.floor(titleSize * 0.9), 3, 0), Rotation = 18, BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0, ZIndex = 20,
-    }, title)
-    new("UIGradient", {
-        Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.3), NumberSequenceKeypoint.new(1, 1),
-        }),
-    }, shine)
-    task.delay(2.0, function()
-        if not running then return end
-        TweenService:Create(shine, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {
-            Position = UDim2.new(0, vp.X + titleSize, 0.5, 0),
-        }):Play()
-    end)
-
-    -- accent line + subtitle ------------------------------------------------------
-    local lineY = math.floor(titleH / 2) + 14
-    local line = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.45, lineY), Size = UDim2.new(0, 0, 0, 2),
-        BackgroundColor3 = ICE, BorderSizePixel = 0, ZIndex = 5,
+    -- title + subtitle (hidden until the boom) -----------------------------------------------------------------
+    local tSize = math.clamp(math.floor(vp.X / 20), 22, 50)
+    local titleY = math.floor(vp.Y * CY + S * 0.5 + 40)
+    local titleScale
+    local tl = new("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, titleY), Size = UDim2.new(1, 0, 0, tSize + 8),
+        BackgroundTransparency = 1, Text = string.upper(INTRO_TEXT), Font = Enum.Font.GothamBlack, TextSize = tSize,
+        TextColor3 = Color3.new(1, 1, 1), TextTransparency = 1, ZIndex = 7,
     }, content)
-    new("UIGradient", {
-        Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.25, 0),
-            NumberSequenceKeypoint.new(0.75, 0), NumberSequenceKeypoint.new(1, 1),
-        }),
-    }, line)
-    task.delay(1.5, function()
-        if not running then return end
-        TweenService:Create(line, TweenInfo.new(0.8, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-            Size = UDim2.new(0, math.floor(vp.X * 0.42), 0, 2),
-        }):Play()
-    end)
+    local tlStroke = new("UIStroke", { Color = ICE, Thickness = 2, Transparency = 1 }, tl)
+    titleScale = new("UIScale", { Scale = 1.7 }, tl)
     local sub = new("TextLabel", {
-        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.45, lineY + 12), Size = UDim2.new(1, 0, 0, 24),
-        BackgroundTransparency = 1, Text = "❄  A U T O   F I S H  ❄", Font = Enum.Font.GothamBold, TextSize = 15,
-        TextColor3 = ICE, TextTransparency = 1, ZIndex = 5,
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, titleY + math.floor(tSize / 2) + 10), Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1, Text = "A U T O   F I S H", Font = Enum.Font.GothamBold, TextSize = 14,
+        TextColor3 = ICE, TextTransparency = 1, ZIndex = 7,
     }, content)
-    task.delay(1.9, function()
-        if not running then return end
-        TweenService:Create(sub, TweenInfo.new(0.6), { TextTransparency = 0.1 }):Play()
-    end)
 
-    -- loading bar ------------------------------------------------------------------
-    local barW = math.clamp(math.floor(vp.X * 0.5), 200, 420)
+    -- thin loading bar ----------------------------------------------------------------------------------------------
+    local barW = math.clamp(math.floor(vp.X * 0.4), 180, 360)
     local barBg = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.82, 0), Size = UDim2.new(0, barW, 0, 5),
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, math.min(vp.Y - 40, titleY + tSize + 54)), Size = UDim2.new(0, barW, 0, 4),
         BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 5,
     }, content)
-    corner(barBg, 3)
+    corner(barBg, 2)
     local barFill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = ICE, BorderSizePixel = 0, ZIndex = 6 }, barBg)
-    corner(barFill, 3)
+    corner(barFill, 2)
     new("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(0, 140, 255), Color3.fromRGB(150, 255, 255)) }, barFill)
-    local pct = new("TextLabel", {
-        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0.82, -10), Size = UDim2.new(0, barW, 0, 16),
-        BackgroundTransparency = 1, Text = "LOADING  0%", Font = Enum.Font.GothamBold, TextSize = 11,
-        TextColor3 = SNOW, TextTransparency = 1, ZIndex = 5,
-    }, content)
-    TweenService:Create(barBg, TweenInfo.new(0.5), { BackgroundTransparency = 0.85 }):Play()
-    TweenService:Create(pct, TweenInfo.new(0.5), { TextTransparency = 0.2 }):Play()
 
-    local loadStart = tick() + 0.5
-    local loadTime = 2.8
-    while running and not skip do
-        local p = math.clamp((tick() - loadStart) / loadTime, 0, 1)
-        barFill.Size = UDim2.new(p, 0, 1, 0)
-        pct.Text = string.format("LOADING  %d%%", math.floor(p * 100))
-        if p >= 1 then break end
-        task.wait(0.03)
+    -- the boom: white flash, shock rings, speed lines, ice sparks, screen shake, blur spike -------------------------
+    local flash = new("Frame", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 50,
+    }, gui)
+    local breathe, breathT = false, tick()
+    introConns[#introConns + 1] = RunService.RenderStepped:Connect(function()
+        if breathe then bearScale.Scale = 1 + 0.025 * math.sin((tick() - breathT) * 3.2) end
+    end)
+    local function boom()
+        play(skillSound)
+        TweenService:Create(bearScale, TweenInfo.new(0.13, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Scale = 1.55 }):Play()
+        task.delay(0.13, function()
+            if not running then return end
+            TweenService:Create(bearScale, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+            task.delay(0.55, function() breathT = tick(); breathe = true end)
+        end)
+        flash.BackgroundTransparency = 0.05
+        TweenService:Create(flash, TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = 1 }):Play()
+        if introBlur then
+            introBlur.Size = 56
+            TweenService:Create(introBlur, TweenInfo.new(0.7), { Size = 22 }):Play()
+        end
+        for i = 1, 3 do                                                              -- shock rings
+            task.delay((i - 1) * 0.09, function()
+                if not running then return end
+                local r = new("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, S * 0.3, 0, S * 0.3),
+                    BackgroundTransparency = 1, ZIndex = 4,
+                }, center)
+                corner(r, S)
+                local st = new("UIStroke", { Color = (i == 2) and SNOW or ICE, Thickness = 7 - i, Transparency = 0.05 }, r)
+                local d = S * (2.6 + i * 0.7)
+                TweenService:Create(r, TweenInfo.new(0.7, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Size = UDim2.new(0, d, 0, d) }):Play()
+                TweenService:Create(st, TweenInfo.new(0.7), { Transparency = 1, Thickness = 1 }):Play()
+            end)
+        end
+        for i = 1, 18 do                                                             -- speed lines
+            local ang = (i - 1) * 20 + math.random(-6, 6)
+            local arm = new("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, 0, 0, 0),
+                BackgroundTransparency = 1, Rotation = ang, ZIndex = 4,
+            }, center)
+            local len = S * (0.35 + math.random() * 0.45)
+            local l = new("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, S * 0.42, 0, 0), Size = UDim2.new(0, len, 0, 2 + math.random(0, 2)),
+                BackgroundColor3 = (i % 2 == 0) and ICE or SNOW, BorderSizePixel = 0,
+            }, arm)
+            TweenService:Create(l, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+                Position = UDim2.new(0, S * (1.05 + math.random() * 0.6), 0, 0), Size = UDim2.new(0, 4, 0, 1), BackgroundTransparency = 1,
+            }):Play()
+            task.delay(0.6, function() pcall(function() arm:Destroy() end) end)
+        end
+        for i = 1, 26 do                                                             -- ice sparks
+            local ang = math.random() * 6.2832
+            local d = S * (0.7 + math.random() * 1.1)
+            local sz = math.random(4, 9)
+            local sp = new("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, sz, 0, sz),
+                BackgroundColor3 = (i % 3 == 0) and Color3.new(1, 1, 1) or ICE, BorderSizePixel = 0, Rotation = math.random(0, 90), ZIndex = 8,
+            }, center)
+            TweenService:Create(sp, TweenInfo.new(0.7 + math.random() * 0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+                Position = UDim2.new(0, math.cos(ang) * d, 0, math.sin(ang) * d + S * 0.12), BackgroundTransparency = 1, Rotation = math.random(-200, 200),
+            }):Play()
+            task.delay(1.2, function() pcall(function() sp:Destroy() end) end)
+        end
+        task.spawn(function()                                                        -- screen shake
+            local t0 = tick()
+            while running and tick() - t0 < 0.6 do
+                local k = (1 - (tick() - t0) / 0.6) ^ 2 * 16
+                content.Position = UDim2.new(0, (math.random() * 2 - 1) * k, 0, (math.random() * 2 - 1) * k)
+                task.wait()
+            end
+            content.Position = UDim2.new(0, 0, 0, 0)
+        end)
+    end
+
+    sleep(0.55)                                                                      -- a moment of dark ... then BOOM
+    if running and not skip then
+        boom()
+        sleep(0.35)
+        TweenService:Create(tl, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { TextTransparency = 0 }):Play()
+        TweenService:Create(tlStroke, TweenInfo.new(0.4), { Transparency = 0.35 }):Play()
+        TweenService:Create(titleScale, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+        sleep(0.35)
+        TweenService:Create(sub, TweenInfo.new(0.5), { TextTransparency = 0.1 }):Play()
+        TweenService:Create(barBg, TweenInfo.new(0.4), { BackgroundTransparency = 0.85 }):Play()
+        TweenService:Create(barFill, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = UDim2.new(1, 0, 1, 0) }):Play()
+        sleep(1.7)
     end
     if not running then return end
 
-    -- outro: title zooms through the screen while everything fades --------------------
-    barFill.Size = UDim2.new(1, 0, 1, 0)
-    pct.Text = "READY  100%"
-    sleep(0.3)
-    TweenService:Create(titleScale, TweenInfo.new(0.6, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1.4 }):Play()
-    TweenService:Create(content, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
-    TweenService:Create(bg, TweenInfo.new(0.7), { BackgroundTransparency = 1 }):Play()
-    if introBlur then TweenService:Create(introBlur, TweenInfo.new(0.7), { Size = 0 }):Play() end
-    local e = tick() + 0.75
+    -- outro: the bear rushes the screen while everything fades -------------------------------------------------------
+    breathe = false
+    TweenService:Create(bearScale, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1.5 }):Play()
+    TweenService:Create(titleScale, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1.3 }):Play()
+    TweenService:Create(content, TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
+    TweenService:Create(bg, TweenInfo.new(0.65), { BackgroundTransparency = 1 }):Play()
+    if introBlur then TweenService:Create(introBlur, TweenInfo.new(0.65), { Size = 0 }):Play() end
+    local e = tick() + 0.7
     while running and tick() < e do task.wait(0.03) end
 end
 
@@ -6037,7 +6267,7 @@ if SHOW_INTRO then
         if not ok then warn("[PPINGYYY AutoFish] intro error: " .. tostring(err)) end
         cleanupIntro()
         if running then
-            Main.Size = UDim2.new(0, 390, 0, 0)
+            Main.Size = UDim2.new(0, FULL_SIZE.X.Offset, 0, 0)
             Main.Visible = true
             TweenService:Create(Main, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = FULL_SIZE }):Play()
         end
