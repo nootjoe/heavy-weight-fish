@@ -1,6 +1,6 @@
 --[[
     ★ PPINGYYY AUTO FISH ★  v8 (collapsible UI + Quest tab)
-    Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling + Anti-AFK + Money Stats + Discord Webhook + Taoist/Maoshan ESP + "4896 Polar Bear" intro
+    Auto Cast + Cast Delay + Anchor Bar (minigame) + Auto Skill + Economy & Selling + Anti-AFK + Money Stats + Discord Webhook + Taoist/Maoshan ESP
 
     Game logic used (taken from the working fishing script):
       Character attributes : Type ("Fishing Rod"), Fishing, Minigame, CDForTheNextThrow, Swimming
@@ -1158,7 +1158,7 @@ end)
 -- Performance saver ------------------------------------------------------------------------
 -- Everything here is reversible: the original values are remembered and restored when a switch is turned off
 -- (or when the script is closed).
-local perf = { black = false, lowgfx = false, nofx = false, mute = false, fps = false, hide = false, tick = nil }
+local perf = { black = false, lowgfx = false, nofx = false, mute = false, fps = false, hide = false, ultra = false, tick = nil }
 do
     local Lighting = game:GetService("Lighting")
     local saved = setmetatable({}, { __mode = "k" })   -- [instance] = { property = original value }
@@ -1435,16 +1435,91 @@ do
         end
     end
 
+    -- ULTRA: what the other savers do not touch ----------------------------------------------------------------------
+    --  * every animation of other characters / NPCs / bosses is stopped (they keep being restarted by the game, so it is
+    --    repeated every second)  * billboard / surface GUIs in the world (name tags, markers) are switched off
+    --  * terrain grass decoration off, global shadows off, Lighting technology -> Compatibility (executor property access)
+    --  * the script's own UI refresh slows down to every 5 s
+    -- Everything is restored when it is switched off (animations simply start again).
+    local ultraAnims = setmetatable({}, { __mode = "k" })
+    local ultraConn, ultraToken = nil, 0
+    local function mineOrEsp(d)
+        local c = lp.Character
+        return (c ~= nil and d:IsDescendantOf(c)) or (espFolder ~= nil and d:IsDescendantOf(espFolder))
+    end
+    local function ultraItem(d)
+        if d:IsA("Animator") then
+            if not mineOrEsp(d) then ultraAnims[d] = true end
+        elseif d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
+            if not mineOrEsp(d) then setProp(d, "Enabled", false) end
+        end
+    end
+    local function ultraStopAnims()
+        for a in pairs(ultraAnims) do
+            if a.Parent then
+                pcall(function()
+                    for _, tr in ipairs(a:GetPlayingAnimationTracks()) do tr:Stop(0) end
+                end)
+            else
+                ultraAnims[a] = nil
+            end
+        end
+    end
+    local function ultraWorld(on)
+        local terrain = workspace:FindFirstChildOfClass("Terrain")
+        if on then
+            if sethiddenproperty and gethiddenproperty then
+                pcall(function()
+                    if terrain and g.deco == nil then g.deco = { (gethiddenproperty(terrain, "Decoration")) } end
+                    if terrain then sethiddenproperty(terrain, "Decoration", false) end
+                    if g.tech == nil then g.tech = { (gethiddenproperty(Lighting, "Technology")) } end
+                    sethiddenproperty(Lighting, "Technology", Enum.Technology.Compatibility)
+                end)
+            end
+            setProp(Lighting, "GlobalShadows", false)
+        else
+            if sethiddenproperty then
+                pcall(function() if terrain and g.deco ~= nil then sethiddenproperty(terrain, "Decoration", g.deco[1]) end end)
+                pcall(function() if g.tech ~= nil then sethiddenproperty(Lighting, "Technology", g.tech[1]) end end)
+            end
+            g.deco, g.tech = nil, nil
+            restoreProps(function(i) return i == Lighting end)
+        end
+    end
+    local function ultraAll(on)
+        ultraToken = ultraToken + 1
+        if ultraConn then ultraConn:Disconnect(); ultraConn = nil end
+        ultraWorld(on)
+        if on then
+            local token = ultraToken
+            ultraConn = Workspace.DescendantAdded:Connect(ultraItem)
+            task.spawn(function()
+                local n = 0
+                for _, d in ipairs(Workspace:GetDescendants()) do
+                    if token ~= ultraToken or not running then return end
+                    ultraItem(d)
+                    n = n + 1
+                    if n % 1500 == 0 then task.wait() end
+                end
+            end)
+        else
+            restoreProps(function(i) return i:IsA("BillboardGui") or i:IsA("SurfaceGui") end)
+            for a in pairs(ultraAnims) do ultraAnims[a] = nil end
+        end
+    end
+
     -- public API ---------------------------------------------------------------------------
     function perf.setBlack(on) perf.black = on and true or false; black(perf.black); refreshFps() end
     function perf.setLowGfx(on) perf.lowgfx = on and true or false; lowGfx(perf.lowgfx) end
     function perf.setHide(on) perf.hide = on and true or false; hidePlayers(perf.hide) end
+    function perf.setUltra(on) perf.ultra = on and true or false; ultraAll(perf.ultra) end
     function perf.setNoFx(on) perf.nofx = on and true or false; noFx(perf.nofx) end
     function perf.setMute(on) perf.mute = on and true or false; return mute(perf.mute) end
     function perf.setFps(on) perf.fps = on and true or false; return refreshFps() end
     function perf.refreshFps() return refreshFps() end
     function perf.restoreAll()
-        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps, perf.hide = false, false, false, false, false, false
+        perf.black, perf.lowgfx, perf.nofx, perf.mute, perf.fps, perf.hide, perf.ultra = false, false, false, false, false, false, false
+        pcall(ultraAll, false)
         pcall(black, false)
         pcall(hidePlayers, false)
         pcall(lowGfx, false)
@@ -1461,6 +1536,7 @@ do
         if perf.nofx then on[#on + 1] = "no-fx" end
         if perf.mute then on[#on + 1] = "mute" end
         if perf.hide then on[#on + 1] = "hide-players" end
+        if perf.ultra then on[#on + 1] = "ULTRA" end
         if perf.fps then on[#on + 1] = "fps " .. Config.FpsCap end
         return #on > 0 and table.concat(on, ", ") or "all off"
     end
@@ -1469,6 +1545,16 @@ do
         if perf.lowgfx and now - lastReapply >= 5 then
             lastReapply = now
             pcall(lowGfx, true)
+        end
+        if perf.ultra then
+            if now - (perf.lastAnim or 0) >= 1 then
+                perf.lastAnim = now
+                pcall(ultraStopAnims)
+            end
+            if now - (perf.lastWorld or 0) >= 5 then
+                perf.lastWorld = now
+                pcall(ultraWorld, true)      -- the game may switch shadows etc. back on
+            end
         end
         if perf.hide and now - (perf.lastHide or 0) >= 4 then
             perf.lastHide = now
@@ -1714,6 +1800,7 @@ do
         hm.pendingCast = nil
         hm.fails = 0
         hm.needFace = false
+        hm.tried, hm.turns = nil, 0
     end
 
     function hm.setSpotHere()
@@ -1951,18 +2038,78 @@ do
         return nil
     end
 
+    -- all 24 directions from `pos` with a score (same rules as seaLook, plus obstacle rays at foot / chest / head height:
+    -- the server refuses a cast when something stands in front of the character)
+    function hm.lookScores(pos)
+        local char = lp.Character
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local skip = { char }
+        local boats = workspace:FindFirstChild("Boat")
+        if boats then skip[#skip + 1] = boats end
+        params.FilterDescendantsInstances = skip
+        params.IgnoreWater = false
+        local level = 0
+        pcall(function() level = tonumber(game:GetService("ReplicatedStorage").SeaLevel.Value) or 0 end)
+        local out = {}
+        for i = 0, 23 do
+            local ang = i / 24 * math.pi * 2
+            local look = Vector3.new(-math.sin(ang), 0, -math.cos(ang))
+            local score = 0
+            for _, d in ipairs({ 10, 18, 28, 40, 55 }) do
+                local q = pos + look * d
+                local hit = workspace:Raycast(Vector3.new(q.X, pos.Y + 40, q.Z), Vector3.new(0, -140, 0), params)
+                if hit then
+                    if hit.Material == Enum.Material.Water or hit.Position.Y <= level + 1.5 then
+                        score = score + 1
+                    elseif hit.Position.Y > pos.Y - 3 then
+                        score = score - 2
+                    end
+                end
+            end
+            for _, h in ipairs({ 0.6, 1.5, 3.5 }) do
+                local wall = workspace:Raycast(pos + Vector3.new(0, h, 0), look * 12, params)
+                if wall and wall.Material ~= Enum.Material.Water then score = score - 2 end
+            end
+            out[#out + 1] = { look = look, score = score, idx = i }
+        end
+        return out
+    end
+
+    -- a cast failed again: the next direction to try (not tried since the last good cast, best score first, close to the
+    -- current direction on ties). When all 24 have been tried the list starts over.
+    function hm.nextLook(pos, cur)
+        hm.tried = hm.tried or {}
+        local function idxOf(v) return math.floor(((math.atan2(-v.X, -v.Z)) % (math.pi * 2)) / (math.pi * 2) * 24 + 0.5) % 24 end
+        hm.tried[idxOf(cur)] = true
+        local n = 0
+        for _ in pairs(hm.tried) do n = n + 1 end
+        if n >= 24 then hm.tried = { [idxOf(cur)] = true } end
+        local okS, list = pcall(hm.lookScores, pos)
+        if not okS then return nil end
+        local best, bestV = nil, -1e9
+        for _, c in ipairs(list) do
+            if not hm.tried[c.idx] then
+                local v = c.score - 0.02 * math.deg(math.acos(math.clamp(c.look:Dot(cur), -1, 1)))
+                if v > bestV then best, bestV = c, v end
+            end
+        end
+        if best then hm.tried[best.idx] = true; return best.look end
+        return nil
+    end
+
     -- go back to the spot (walk, or snap when very far) and face the sea
     function hm.align(why)
         if hm.busy or not hm.spot then return end
-        -- two casts in a row did not reach the water: the saved direction is wrong (cast hits the ground) -> look for the sea
-        if hm.fails >= 2 and not hm.reseaAt or (hm.fails >= 2 and tick() - hm.reseaAt > 4) then
-            hm.reseaAt = tick()
-            local okS, nl = pcall(hm.seaLook, hm.spot.pos, nil)
-            if okS and nl then
-                -- a failed direction is a bad candidate: if the finder insists on the same one, turn 90 degrees
-                if nl:Dot(hm.spot.look) > 0.95 then nl = rotated(nl, 90) end
+        -- two casts in a row did not start: something blocks the way (or it is not water) -> turn to another direction.
+        -- Every new direction gets one try; if that fails too the next one is taken, until a cast works.
+        if hm.fails >= 2 then
+            local nl = hm.nextLook(hm.spot.pos, hm.spot.look)
+            if nl then
                 hm.spot.look = nl
-                hm.fails = 0
+                hm.fails = 1
+                hm.turns = (hm.turns or 0) + 1
+                why = "Cast blocked - trying another direction (#" .. hm.turns .. ")"
             end
         end
         local spot = hm.spot
@@ -2065,10 +2212,16 @@ do
             hm.fails = 0
             hm.needFace = false
             if not hm.spot then hm.spot = hm.makeSpot(p.cf) end   -- first good cast = the fishing spot
+            if hm.tried and next(hm.tried) and hm.spot then       -- this cast worked after turning: keep that direction
+                local lk = flat(p.cf.LookVector)
+                if lk then hm.spot.look = lk end
+            end
+            hm.tried, hm.turns = nil, 0
         elseif now - p.t >= CAST_VERIFY then
             hm.pendingCast = nil
             hm.fails = hm.fails + 1
             hm.needFace = true
+            if not hm.spot then hm.spot = hm.makeSpot(p.cf) end   -- no saved spot yet: recover from where we stand
         end
     end
 end
@@ -2277,8 +2430,8 @@ local function engineStep()
         return
     end
 
-    if Config.FaceSea and hm.needAlign(root) then
-        hm.align("Facing the sea...")
+    if (Config.FaceSea or hm.fails > 0) and hm.needAlign(root) then
+        hm.align((hm.fails > 0) and "Cast failed - facing the spot again..." or "Facing the sea...")
         statusText = hm.text
         return
     end
@@ -2424,7 +2577,7 @@ function ui.fitSize()
     local w = math.clamp(vp.X - 24, 330, 620)
     local h = math.clamp(vp.Y - (mobile and 30 or 60), 260, 470)
     ui.sbW = (w < 500) and 78 or 124          -- sidebar width (narrower on a phone)
-    return UDim2.new(0, w, 0, h), UDim2.new(0, w, 0, 60), mobile, h
+    return UDim2.new(0, w, 0, h), UDim2.new(0, 56, 0, 56), mobile, h
 end
 local FULL_SIZE, MIN_SIZE = ui.fitSize()
 
@@ -2432,7 +2585,7 @@ local Main = new("Frame", {
     Size = FULL_SIZE, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
     BackgroundColor3 = Color3.fromRGB(17, 17, 18), BorderSizePixel = 0, ClipsDescendants = true,
 }, sg)
-corner(Main, 20)
+ui.mainCorner = corner(Main, 20)
 new("UIStroke", { Color = Color3.fromRGB(40, 40, 42), Thickness = 1 }, Main)
 
 local TitleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 60), BackgroundTransparency = 1 }, Main)
@@ -2456,6 +2609,21 @@ do   -- logo + title + subtitle
     }, TitleBar)
 end
 
+do   -- the round logo button shown instead of the window while it is minimized (click = open, drag = move)
+    local lb = new("TextButton", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Visible = false, ZIndex = 20,
+    }, Main)
+    local ring = new("Frame", {
+        Size = UDim2.new(0, 24, 0, 24), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundTransparency = 1, ZIndex = 21,
+    }, lb)
+    corner(ring, 12)
+    new("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 3.5 }, ring)
+    local dot = new("Frame", {
+        Size = UDim2.new(0, 8, 0, 8), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundColor3 = COL_GREEN, BorderSizePixel = 0, ZIndex = 21,
+    }, lb)
+    corner(dot, 4)
+    ui.logoBtn = lb
+end
 function ui.titleBtn(text, x, color)
     local b = new("TextButton", {
         Size = UDim2.new(0, 30, 0, 30), Position = UDim2.new(1, x, 0, 15), Text = text, Font = Enum.Font.GothamBold,
@@ -5664,7 +5832,7 @@ setPage("Quest")
     end
     task.spawn(function()
         while running do
-            task.wait(1.5)
+            task.wait(perf.ultra and 5 or 1.5)
             pcall(function()
                 local t = readTicket()
                 local o = t.objs[1]
@@ -5730,13 +5898,17 @@ do
         play(clickSound)
         perf.setHide(v)
     end)
-    perf.vis = { lowgfx = v1, nofx = v2, mute = v3, fps = v4, hide = v5 }
+    local _, v6 = toggleButton("ULTRA saver (stops other animations, world name tags, grass, shadows; UI refresh slower)", 34, false, function(v)
+        play(clickSound)
+        perf.setUltra(v)
+    end)
+    perf.vis = { lowgfx = v1, nofx = v2, mute = v3, fps = v4, hide = v5, ultra = v6 }
 end
-actionButton("Max saver (everything on)", 34, function()
+actionButton("Max saver (everything on, incl. ULTRA)", 34, function()
     play(clickSound)
     perf.setBlack(true); if ui.setBlack then ui.setBlack(true) end
-    perf.setLowGfx(true); perf.setNoFx(true); perf.setMute(true); perf.setFps(true); perf.setHide(true)
-    for _, k in ipairs({ "lowgfx", "nofx", "mute", "fps", "hide" }) do
+    perf.setLowGfx(true); perf.setNoFx(true); perf.setMute(true); perf.setFps(true); perf.setHide(true); perf.setUltra(true)
+    for _, k in ipairs({ "lowgfx", "nofx", "mute", "fps", "hide", "ultra" }) do
         if perf.vis[k] then pcall(perf.vis[k], true) end
     end
 end)
@@ -5780,7 +5952,7 @@ do   -- a small pill as the grip (drag here or by the title bar)
 end
 do
     local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
-    for _, handle in ipairs({ TitleBar, MoveBtn }) do
+    for _, handle in ipairs({ TitleBar, MoveBtn, ui.logoBtn }) do
     handle.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
@@ -5920,17 +6092,22 @@ do
     hook()
     conns[#conns + 1] = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function() hook(); applyFit() end)
 end
-MinBtn.MouseButton1Click:Connect(function()
-    play(clickSound)
-    minimized = not minimized
-    if minimized then
+function ui.setMin(on)
+    minimized = on
+    if on then
         Content.Visible = false
         TabBar.Visible = false
         StatusBox.Visible = false
         MoveBtn.Visible = false
+        TitleBar.Visible = false
+        ui.logoBtn.Visible = true
+        TweenService:Create(ui.mainCorner, TweenInfo.new(0.2), { CornerRadius = UDim.new(0, 28) }):Play()
         TweenService:Create(Main, TweenInfo.new(0.2), { Size = MIN_SIZE }):Play()
         MinBtn.Text = "+"
     else
+        ui.logoBtn.Visible = false
+        TitleBar.Visible = true
+        TweenService:Create(ui.mainCorner, TweenInfo.new(0.2), { CornerRadius = UDim.new(0, 20) }):Play()
         TweenService:Create(Main, TweenInfo.new(0.2), { Size = FULL_SIZE }):Play()
         task.delay(0.2, function()
             if running and not minimized then
@@ -5942,9 +6119,23 @@ MinBtn.MouseButton1Click:Connect(function()
         end)
         MinBtn.Text = "—"
     end
+end
+MinBtn.MouseButton1Click:Connect(function()
+    play(clickSound)
+    ui.setMin(not minimized)
 end)
-
-local cleanupIntro = nil
+do   -- logo click opens the window again; a drag (moved more than a few pixels) does not
+    local p0
+    ui.logoBtn.MouseButton1Down:Connect(function() p0 = Main.Position end)
+    ui.logoBtn.MouseButton1Click:Connect(function()
+        if p0 then
+            local dx, dy = Main.Position.X.Offset - p0.X.Offset, Main.Position.Y.Offset - p0.Y.Offset
+            if dx * dx + dy * dy > 36 then return end
+        end
+        play(clickSound)
+        ui.setMin(false)
+    end)
+end
 
 local function unload()
     if not running then return end
@@ -5957,7 +6148,6 @@ local function unload()
     pcall(function() espFolder:Destroy() end)
     pcall(perf.restoreAll)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-    if cleanupIntro then pcall(cleanupIntro) end
     pcall(function() if ui.helpGui then ui.helpGui:Destroy() end end)
     pcall(function() sg:Destroy() end)
     if env.PPAutoFishUnload == unload then env.PPAutoFishUnload = nil end
@@ -5978,303 +6168,6 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, processe
         if ui.setBlack then ui.setBlack(perf.black) end
     end
 end)
-
----------------------------------------------------------------------
--- Intro animation: "4896 Polar Bear"
--- (set getgenv().PP_ShowIntro = false before running to disable it; click / tap skips it)
----------------------------------------------------------------------
-do  -- (scoped: keeps the number of top-level locals low)
-local INTRO_TEXT = "4896 Polar Bear"
-local SHOW_INTRO = (env.PP_ShowIntro ~= false)
-local introGui, introBlur = nil, nil
-local introConns = {}
-
-cleanupIntro = function()
-    for _, c in ipairs(introConns) do pcall(function() c:Disconnect() end) end
-    introConns = {}
-    if introGui then
-        pcall(function() introGui:Destroy() end)
-        introGui = nil
-    end
-    if introBlur then
-        pcall(function() introBlur:Destroy() end)
-        introBlur = nil
-    end
-end
-
-local function playIntro()
-    local cam = workspace.CurrentCamera
-    local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
-    local titleSize = math.clamp(math.floor(vp.X / 12), 30, 76)
-    local titleH = titleSize + 14
-    local ICE = Color3.fromRGB(0, 225, 255)
-    local SNOW = Color3.fromRGB(235, 248, 255)
-    local skip = false
-
-    local gui = new("ScreenGui", {
-        Name = "PPINGYYY_Intro", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-    })
-    attachGui(gui)
-    introGui = gui
-
-    local function sleep(t)
-        local e = tick() + t
-        while running and not skip and tick() < e do task.wait(0.03) end
-    end
-
-    -- dark icy background -------------------------------------------------
-    local bg = new("Frame", {
-        Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1,
-        BorderSizePixel = 0, ZIndex = 1,
-    }, gui)
-    new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(3, 8, 20), Color3.fromRGB(8, 40, 75)) }, bg)
-    TweenService:Create(bg, TweenInfo.new(0.45), { BackgroundTransparency = 0.05 }):Play()
-
-    -- everything else lives in one CanvasGroup so it can fade out in one tween
-    local content = new("CanvasGroup", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 2 }, gui)
-
-    local skipBtn = new("TextButton", {
-        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", ZIndex = 100, AutoButtonColor = false,
-    }, gui)
-    skipBtn.MouseButton1Click:Connect(function() skip = true end)
-    new("TextLabel", {
-        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -14), Size = UDim2.new(0, 300, 0, 16),
-        BackgroundTransparency = 1, Text = "tap / click to skip", TextColor3 = SNOW, TextTransparency = 0.6,
-        Font = Enum.Font.Gotham, TextSize = 11, ZIndex = 3,
-    }, content)
-
-    -- blur the game behind ---------------------------------------------------
-    pcall(function()
-        local blur = Instance.new("BlurEffect")
-        blur.Size = 0
-        blur.Parent = game:GetService("Lighting")
-        introBlur = blur
-        TweenService:Create(blur, TweenInfo.new(0.5), { Size = 22 }):Play()
-    end)
-
-    -- falling snow -------------------------------------------------------------
-    local flakes = {}
-    for i = 1, 45 do
-        local s = math.random(3, 8)
-        local f = new("Frame", {
-            Size = UDim2.new(0, s, 0, s), BackgroundColor3 = SNOW, BackgroundTransparency = math.random(25, 70) / 100,
-            BorderSizePixel = 0, ZIndex = 2,
-        }, content)
-        corner(f, s)
-        flakes[i] = {
-            f = f, x = math.random(), y = math.random(), speed = 0.05 + math.random() * 0.12,
-            sway = math.random() * 6.28, amp = 0.01 + math.random() * 0.02,
-        }
-    end
-    local snowStart = tick()
-    introConns[#introConns + 1] = RunService.RenderStepped:Connect(function(dt)
-        local t = tick() - snowStart
-        for _, fl in ipairs(flakes) do
-            fl.y = fl.y + fl.speed * dt
-            if fl.y > 1.05 then
-                fl.y = -0.05
-                fl.x = math.random()
-            end
-            fl.f.Position = UDim2.new(fl.x + math.sin(t * 1.2 + fl.sway) * fl.amp, 0, fl.y, 0)
-        end
-    end)
-
-    -- the polar bear: drawn from simple shapes (no image download needed), sunglasses on --------------------------
-    local S = math.clamp(math.floor(math.min(vp.X * 0.55, vp.Y * 0.46)), 150, 320)
-    local CY = 0.42
-    local DARK = Color3.fromRGB(10, 14, 24)
-    local center = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, CY, 0), Size = UDim2.new(0, 0, 0, 0), BackgroundTransparency = 1,
-    }, content)
-    local bear = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, S, 0, S), BackgroundTransparency = 1, ZIndex = 6,
-    }, center)
-    local bearScale = new("UIScale", { Scale = 0 }, bear)
-    local function shape(parent, cx, cy, w, h, color, rad, rot, z)
-        local f = new("Frame", {
-            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(cx, 0, cy, 0), Size = UDim2.new(w, 0, h, 0),
-            BackgroundColor3 = color, BorderSizePixel = 0, Rotation = rot or 0, ZIndex = z or 6,
-        }, parent)
-        new("UICorner", { CornerRadius = UDim.new(rad or 0, 0) }, f)
-        return f
-    end
-    local glow = shape(bear, 0.5, 0.52, 1.4, 1.4, ICE, 0.5, 0, 5)
-    glow.BackgroundTransparency = 0.84
-    for _, x in ipairs({ 0.2, 0.8 }) do                                           -- ears
-        local ear = shape(bear, x, 0.2, 0.27, 0.27, SNOW, 0.5, 0, 6)
-        new("UIStroke", { Color = ICE, Thickness = 3 }, ear)
-        shape(bear, x, 0.21, 0.13, 0.13, Color3.fromRGB(125, 180, 212), 0.5, 0, 7)
-    end
-    local head = shape(bear, 0.5, 0.54, 0.8, 0.74, SNOW, 0.5, 0, 8)                -- head
-    new("UIStroke", { Color = ICE, Thickness = 3 }, head)
-    new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(196, 222, 242)) }, head)
-    local muzzle = shape(bear, 0.5, 0.7, 0.38, 0.28, Color3.fromRGB(228, 240, 250), 0.5, 0, 9)
-    new("UIStroke", { Color = Color3.fromRGB(170, 205, 228), Thickness = 1.5 }, muzzle)
-    shape(bear, 0.5, 0.625, 0.14, 0.085, DARK, 0.5, 0, 10)                         -- nose
-    local shine = shape(bear, 0.465, 0.61, 0.04, 0.02, Color3.new(1, 1, 1), 0.5, 0, 11)
-    shine.BackgroundTransparency = 0.3
-    shape(bear, 0.5, 0.69, 0.014, 0.05, DARK, 0.5, 0, 10)                          -- mouth
-    shape(bear, 0.462, 0.727, 0.07, 0.016, DARK, 0.5, 24, 10)
-    shape(bear, 0.538, 0.727, 0.07, 0.016, DARK, 0.5, -24, 10)
-    shape(bear, 0.17, 0.46, 0.1, 0.028, DARK, 0.5, -8, 9)                          -- sunglasses: arms, bridge, lenses
-    shape(bear, 0.83, 0.46, 0.1, 0.028, DARK, 0.5, 8, 9)
-    shape(bear, 0.5, 0.45, 0.1, 0.03, DARK, 0.5, 0, 10)
-    for _, x in ipairs({ 0.335, 0.665 }) do
-        local lens = shape(bear, x, 0.48, 0.25, 0.15, DARK, 0.4, 0, 10)
-        new("UIStroke", { Color = ICE, Thickness = 2 }, lens)
-        new("UIGradient", { Rotation = 35, Color = ColorSequence.new(DARK, Color3.fromRGB(0, 130, 185)) }, lens)
-        local g1 = shape(lens, 0.3, 0.5, 0.08, 0.8, Color3.new(1, 1, 1), 0.4, 20, 11)
-        g1.BackgroundTransparency = 0.55
-        local g2 = shape(lens, 0.46, 0.5, 0.03, 0.8, Color3.new(1, 1, 1), 0.4, 20, 11)
-        g2.BackgroundTransparency = 0.7
-    end
-
-    -- title + subtitle (hidden until the boom) -----------------------------------------------------------------
-    local tSize = math.clamp(math.floor(vp.X / 20), 22, 50)
-    local titleY = math.floor(vp.Y * CY + S * 0.5 + 40)
-    local titleScale
-    local tl = new("TextLabel", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, titleY), Size = UDim2.new(1, 0, 0, tSize + 8),
-        BackgroundTransparency = 1, Text = string.upper(INTRO_TEXT), Font = Enum.Font.GothamBlack, TextSize = tSize,
-        TextColor3 = Color3.new(1, 1, 1), TextTransparency = 1, ZIndex = 7,
-    }, content)
-    local tlStroke = new("UIStroke", { Color = ICE, Thickness = 2, Transparency = 1 }, tl)
-    titleScale = new("UIScale", { Scale = 1.7 }, tl)
-    local sub = new("TextLabel", {
-        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, titleY + math.floor(tSize / 2) + 10), Size = UDim2.new(1, 0, 0, 22),
-        BackgroundTransparency = 1, Text = "A U T O   F I S H", Font = Enum.Font.GothamBold, TextSize = 14,
-        TextColor3 = ICE, TextTransparency = 1, ZIndex = 7,
-    }, content)
-
-    -- thin loading bar ----------------------------------------------------------------------------------------------
-    local barW = math.clamp(math.floor(vp.X * 0.4), 180, 360)
-    local barBg = new("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, math.min(vp.Y - 40, titleY + tSize + 54)), Size = UDim2.new(0, barW, 0, 4),
-        BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 5,
-    }, content)
-    corner(barBg, 2)
-    local barFill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = ICE, BorderSizePixel = 0, ZIndex = 6 }, barBg)
-    corner(barFill, 2)
-    new("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(0, 140, 255), Color3.fromRGB(150, 255, 255)) }, barFill)
-
-    -- the boom: white flash, shock rings, speed lines, ice sparks, screen shake, blur spike -------------------------
-    local flash = new("Frame", {
-        Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 50,
-    }, gui)
-    local breathe, breathT = false, tick()
-    introConns[#introConns + 1] = RunService.RenderStepped:Connect(function()
-        if breathe then bearScale.Scale = 1 + 0.025 * math.sin((tick() - breathT) * 3.2) end
-    end)
-    local function boom()
-        play(skillSound)
-        TweenService:Create(bearScale, TweenInfo.new(0.13, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Scale = 1.55 }):Play()
-        task.delay(0.13, function()
-            if not running then return end
-            TweenService:Create(bearScale, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
-            task.delay(0.55, function() breathT = tick(); breathe = true end)
-        end)
-        flash.BackgroundTransparency = 0.05
-        TweenService:Create(flash, TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = 1 }):Play()
-        if introBlur then
-            introBlur.Size = 56
-            TweenService:Create(introBlur, TweenInfo.new(0.7), { Size = 22 }):Play()
-        end
-        for i = 1, 3 do                                                              -- shock rings
-            task.delay((i - 1) * 0.09, function()
-                if not running then return end
-                local r = new("Frame", {
-                    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, S * 0.3, 0, S * 0.3),
-                    BackgroundTransparency = 1, ZIndex = 4,
-                }, center)
-                corner(r, S)
-                local st = new("UIStroke", { Color = (i == 2) and SNOW or ICE, Thickness = 7 - i, Transparency = 0.05 }, r)
-                local d = S * (2.6 + i * 0.7)
-                TweenService:Create(r, TweenInfo.new(0.7, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Size = UDim2.new(0, d, 0, d) }):Play()
-                TweenService:Create(st, TweenInfo.new(0.7), { Transparency = 1, Thickness = 1 }):Play()
-            end)
-        end
-        for i = 1, 18 do                                                             -- speed lines
-            local ang = (i - 1) * 20 + math.random(-6, 6)
-            local arm = new("Frame", {
-                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, 0, 0, 0),
-                BackgroundTransparency = 1, Rotation = ang, ZIndex = 4,
-            }, center)
-            local len = S * (0.35 + math.random() * 0.45)
-            local l = new("Frame", {
-                AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, S * 0.42, 0, 0), Size = UDim2.new(0, len, 0, 2 + math.random(0, 2)),
-                BackgroundColor3 = (i % 2 == 0) and ICE or SNOW, BorderSizePixel = 0,
-            }, arm)
-            TweenService:Create(l, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-                Position = UDim2.new(0, S * (1.05 + math.random() * 0.6), 0, 0), Size = UDim2.new(0, 4, 0, 1), BackgroundTransparency = 1,
-            }):Play()
-            task.delay(0.6, function() pcall(function() arm:Destroy() end) end)
-        end
-        for i = 1, 26 do                                                             -- ice sparks
-            local ang = math.random() * 6.2832
-            local d = S * (0.7 + math.random() * 1.1)
-            local sz = math.random(4, 9)
-            local sp = new("Frame", {
-                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, sz, 0, sz),
-                BackgroundColor3 = (i % 3 == 0) and Color3.new(1, 1, 1) or ICE, BorderSizePixel = 0, Rotation = math.random(0, 90), ZIndex = 8,
-            }, center)
-            TweenService:Create(sp, TweenInfo.new(0.7 + math.random() * 0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-                Position = UDim2.new(0, math.cos(ang) * d, 0, math.sin(ang) * d + S * 0.12), BackgroundTransparency = 1, Rotation = math.random(-200, 200),
-            }):Play()
-            task.delay(1.2, function() pcall(function() sp:Destroy() end) end)
-        end
-        task.spawn(function()                                                        -- screen shake
-            local t0 = tick()
-            while running and tick() - t0 < 0.6 do
-                local k = (1 - (tick() - t0) / 0.6) ^ 2 * 16
-                content.Position = UDim2.new(0, (math.random() * 2 - 1) * k, 0, (math.random() * 2 - 1) * k)
-                task.wait()
-            end
-            content.Position = UDim2.new(0, 0, 0, 0)
-        end)
-    end
-
-    sleep(0.55)                                                                      -- a moment of dark ... then BOOM
-    if running and not skip then
-        boom()
-        sleep(0.35)
-        TweenService:Create(tl, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { TextTransparency = 0 }):Play()
-        TweenService:Create(tlStroke, TweenInfo.new(0.4), { Transparency = 0.35 }):Play()
-        TweenService:Create(titleScale, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
-        sleep(0.35)
-        TweenService:Create(sub, TweenInfo.new(0.5), { TextTransparency = 0.1 }):Play()
-        TweenService:Create(barBg, TweenInfo.new(0.4), { BackgroundTransparency = 0.85 }):Play()
-        TweenService:Create(barFill, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = UDim2.new(1, 0, 1, 0) }):Play()
-        sleep(1.7)
-    end
-    if not running then return end
-
-    -- outro: the bear rushes the screen while everything fades -------------------------------------------------------
-    breathe = false
-    TweenService:Create(bearScale, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1.5 }):Play()
-    TweenService:Create(titleScale, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1.3 }):Play()
-    TweenService:Create(content, TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
-    TweenService:Create(bg, TweenInfo.new(0.65), { BackgroundTransparency = 1 }):Play()
-    if introBlur then TweenService:Create(introBlur, TweenInfo.new(0.65), { Size = 0 }):Play() end
-    local e = tick() + 0.7
-    while running and tick() < e do task.wait(0.03) end
-end
-
-if SHOW_INTRO then
-    Main.Visible = false
-    task.spawn(function()
-        local ok, err = pcall(playIntro)
-        if not ok then warn("[PPINGYYY AutoFish] intro error: " .. tostring(err)) end
-        cleanupIntro()
-        if running then
-            Main.Size = UDim2.new(0, FULL_SIZE.X.Offset, 0, 0)
-            Main.Visible = true
-            TweenService:Create(Main, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = FULL_SIZE }):Play()
-        end
-    end)
-end
-
-end
 
 ---------------------------------------------------------------------
 -- Start the engine
