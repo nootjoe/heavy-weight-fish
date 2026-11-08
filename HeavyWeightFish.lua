@@ -1447,7 +1447,15 @@ do
     local ultraConn, ultraToken = nil, 0
     local function mineOrEsp(d)
         local c = lp.Character
-        return (c ~= nil and d:IsDescendantOf(c)) or (espFolder ~= nil and d:IsDescendantOf(espFolder))
+        if (c ~= nil and d:IsDescendantOf(c)) or (espFolder ~= nil and d:IsDescendantOf(espFolder)) then return true end
+        -- the game's own inventory / skill screens use models in the workspace (PlayerNPC = the rod / skill preview of the
+        -- inventory): stopping their animations or hiding their GUIs froze the Skill tab, so they are never touched
+        local npc = Workspace:FindFirstChild("PlayerNPC")
+        if npc and d:IsDescendantOf(npc) then return true end
+        local m = d:FindFirstAncestorWhichIsA("Model")
+        if m and (m.Name == lp.Name or m.Name == "PlayerNPC" or string.find(string.lower(m.Name), "preview", 1, true) or string.find(string.lower(m.Name), "viewport", 1, true)) then return true end
+        if d:FindFirstAncestorWhichIsA("ViewportFrame") then return true end
+        return false
     end
     local function ultraItem(d)
         if d:IsA("Animator") then
@@ -1543,6 +1551,18 @@ do
         return #on > 0 and table.concat(on, ", ") or "all off"
     end
     function perf.tick(now)
+        -- UI guard: the game's own windows must never stay switched off by a saver (the Skill / rod screen opens by
+        -- Fisher.Visible while its ScreenGui "Fisher_GUI" has to be enabled)
+        if now - (perf.lastGuard or 0) >= 1 then
+            perf.lastGuard = now
+            pcall(function()
+                if perf.black then return end
+                local pg = lp:FindFirstChild("PlayerGui")
+                local fg = pg and pg:FindFirstChild("Fisher_GUI")
+                local fr = fg and fg:FindFirstChild("Fisher")
+                if fg and fr and fr.Visible and not fg.Enabled then fg.Enabled = true end
+            end)
+        end
         -- the game may switch effects back on (weather, UI blur ...): re-apply now and then
         if perf.lowgfx and now - lastReapply >= 5 then
             lastReapply = now
