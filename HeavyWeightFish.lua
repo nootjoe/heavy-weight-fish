@@ -112,6 +112,8 @@ local Config = {
     BreakMax = 15,            -- ... and latest (the real delay is random and sometimes falls outside this range)
     BreakWalk = 8,            -- studs: how far from the fishing spot a break may wander
     FaceSea = true,           -- before every cast: stand on the saved spot and look in the saved (sea) direction
+    MoveOnNoFish = true,      -- N casts in a row without a single bite -> move to another spot nearby
+    NoFishCasts = 6,          -- ... N
     LeaveGameAFK = true,      -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
     WebhookEnabled = false,
     WebhookUrl = "",
@@ -1762,6 +1764,9 @@ local hm = {
     spot = nil,          -- { pos = Vector3, look = unit flat Vector3 }: where every cast is thrown from
     pendingCast = nil,   -- { t = tick(), cf = CFrame }: cast sent, waiting for Fishing = true
     fails = 0,           -- casts in a row that did not start fishing
+    noFish = 0,          -- casts since the last bite (fish on the line)
+    moves = 0,           -- how many times we moved because nothing bit
+    used = {},           -- spots already tried (flat positions), newest last
     needFace = false,    -- a cast failed: re-face the spot before the next one
     busy = false,        -- a walk / realign routine is running -> the engine must not cast
     text = "",
@@ -1801,6 +1806,7 @@ do
         hm.fails = 0
         hm.needFace = false
         hm.tried, hm.turns = nil, 0
+        hm.anchor, hm.noFish, hm.used = nil, 0, {}
     end
 
     function hm.setSpotHere()
@@ -1810,6 +1816,7 @@ do
             hm.spot = hm.makeSpot(root.CFrame)
             hm.fails = 0
             hm.needFace = false
+            hm.anchor, hm.noFish, hm.used = root.Position, 0, {}
         end
         return hm.spot ~= nil
     end
@@ -2160,6 +2167,65 @@ do
         end)
     end
 
+    -- many casts and no bite: this place gives no fish. Pick another standing spot close to the original one (4..13 studs,
+    -- solid ground at about the same height, open water ahead, not one of the last spots) and walk there.
+    function hm.relocate()
+        local spot = hm.spot
+        if not spot or hm.busy then return false end
+        local char = lp.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then return false end
+        hm.anchor = hm.anchor or spot.pos
+        local anchor = hm.anchor
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local skip = { char }
+        local boats = workspace:FindFirstChild("Boat")
+        if boats then skip[#skip + 1] = boats end
+        params.FilterDescendantsInstances = skip
+        local level = 0
+        pcall(function() level = tonumber(game:GetService("ReplicatedStorage").SeaLevel.Value) or 0 end)
+        local best, bestV = nil, -1e9
+        for _, r in ipairs({ 4, 7, 10, 13 }) do
+            for k = 0, 15 do
+                local ang = k / 16 * math.pi * 2 + r * 0.37
+                local px, pz = anchor.X + math.cos(ang) * r, anchor.Z + math.sin(ang) * r
+                local hit = workspace:Raycast(Vector3.new(px, anchor.Y + 40, pz), Vector3.new(0, -140, 0), params)
+                if hit and hit.Material ~= Enum.Material.Water and hit.Position.Y > level + 1.5 and math.abs(hit.Position.Y + 3 - anchor.Y) <= 3 then
+                    local pos = Vector3.new(px, hit.Position.Y + 3, pz)
+                    local nearUsed = false
+                    for _, u in ipairs(hm.used) do
+                        if (u.X - px) ^ 2 + (u.Z - pz) ^ 2 < 25 then nearUsed = true; break end
+                    end
+                    if not nearUsed then
+                        local okS, list = pcall(hm.lookScores, pos)
+                        if okS then
+                            for _, c in ipairs(list) do
+                                local v = c.score - 0.15 * r - 0.01 * math.deg(math.acos(math.clamp(c.look:Dot(spot.look), -1, 1)))
+                                if c.score >= 3 and v > bestV then best, bestV = { pos = pos, look = c.look }, v end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        hm.noFish = 0
+        if not best then
+            hm.dlog("no bite, but no better standing spot nearby (used " .. #hm.used .. ")")
+            hm.used = {}
+            return false
+        end
+        hm.used[#hm.used + 1] = Vector3.new(spot.pos.X, spot.pos.Y, spot.pos.Z)
+        if #hm.used > 6 then table.remove(hm.used, 1) end
+        hm.moves = hm.moves + 1
+        hm.spot = best
+        hm.fails, hm.needFace = 0, true
+        hm.tried, hm.turns = nil, 0
+        hm.dlog(string.format("no bite for %d casts -> moving to (%.0f,%.0f) look (%.2f,%.2f), move #%d", Config.NoFishCasts, best.pos.X, best.pos.Z, best.look.X, best.look.Z, hm.moves))
+        hm.align("No bite for " .. Config.NoFishCasts .. " casts - moving to another spot")
+        return true
+    end
+
     -- go back to the spot (walk, or snap when very far) and face the sea
     function hm.align(why)
         if hm.busy or not hm.spot then return end
@@ -2322,6 +2388,7 @@ local function engineStep()
     local rodType = char:GetAttribute("Type")
     local isFishing = char:GetAttribute("Fishing") == true
     local isMinigame = (char:GetAttribute("Minigame") == true) or uiVisible
+    if isMinigame then hm.noFish = 0 end
     local isCD = char:GetAttribute("CDForTheNextThrow") == true
     local isSwimming = char:GetAttribute("Swimming") == true
     local hasRod = (rodType == "Fishing Rod")
@@ -2495,6 +2562,10 @@ local function engineStep()
         return
     end
 
+    if Config.MoveOnNoFish and hm.spot and hm.noFish >= (Config.NoFishCasts or 6) and not hm.busy then
+        if hm.relocate() then statusText = hm.text; return end
+    end
+
     if (Config.FaceSea or hm.fails > 0) and hm.needAlign(root) then
         hm.align((hm.fails > 0) and "Cast failed - facing the spot again..." or "Facing the sea...")
         statusText = hm.text
@@ -2504,6 +2575,7 @@ local function engineStep()
     local castCF = root.CFrame
     pcall(function() fishing:FireServer(castCF) end)
     hm.pendingCast = { t = now, cf = castCF }
+    hm.noFish = (hm.noFish or 0) + 1
     lastCastTime = now
     if hm.fails >= 3 then
         statusText = "Casting (last " .. hm.fails .. " casts failed - face the sea, then press Set fishing spot)"
@@ -3174,6 +3246,13 @@ end)
 toggleButton("Face the sea before each cast", 30, Config.FaceSea, function(v)
     play(clickSound)
     Config.FaceSea = v
+end)
+toggleButton("Move when nothing bites", 30, Config.MoveOnNoFish, function(v)
+    play(clickSound)
+    Config.MoveOnNoFish = v
+end)
+makeSlider("Casts without a bite", "", 3, 20, 1, 1, 0, Config.NoFishCasts, function(v)
+    Config.NoFishCasts = v
 end)
 actionButton("Set fishing spot here", 28, function()
     play(clickSound)
