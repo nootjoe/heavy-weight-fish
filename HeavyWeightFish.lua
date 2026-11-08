@@ -4728,6 +4728,16 @@ setPage("Quest")
                 qlog(string.format("sit attempt %d: seat (%d,%.1f,%d) vel %.1f occupant %s disabled %s | me %s from the seat, state %s",
                     try, seat.Position.X, seat.Position.Y, seat.Position.Z, vel, occ, dis,
                     rr and string.format("%d studs", (rr.Position - seat.Position).Magnitude) or "?", tostring(h:GetState())))
+                local ex = {}
+                pcall(function()
+                    ex[#ex + 1] = "loc=" .. tostring(loc) .. " slot=" .. tostring(boat:GetAttribute("SlotIndex")) .. " owner=" .. tostring(boat:GetAttribute("OwnerUserId"))
+                    ex[#ex + 1] = "seat CanCollide=" .. tostring(seat.CanCollide) .. " Anchored=" .. tostring(seat.Anchored) .. " CanTouch=" .. tostring(seat.CanTouch)
+                    ex[#ex + 1] = "root Anchored=" .. tostring(boat.Root.Anchored)
+                    ex[#ex + 1] = "me floor=" .. tostring(h.FloorMaterial) .. " PlatformStand=" .. tostring(h.PlatformStand) .. " Sit=" .. tostring(h.Sit) .. " seatPart=" .. tostring(h.SeatPart)
+                    ex[#ex + 1] = "me Y " .. string.format("%.1f", rr and rr.Position.Y or 0) .. " vel " .. string.format("%.1f", rr and rr.AssemblyLinearVelocity.Magnitude or 0)
+                    ex[#ex + 1] = "sea " .. string.format("%.1f", seaLevel())
+                end)
+                qlog("   details: " .. table.concat(ex, " | "))
             end
             if try > 1 then task.wait(0.6 * try) end            -- big boats (Omega) take longer to settle on the water
             local r = myRoot()
@@ -4996,11 +5006,15 @@ setPage("Quest")
     local function sailRetry(...)
         local args = table.pack(...)
         local ok, why = sail(table.unpack(args, 1, args.n))
-        if not ok and running and not qs.cancel and (tostring(why):find("could not sit", 1, true) or tostring(why):find("did not appear", 1, true)) then
-            qlog("boat: '" .. tostring(why) .. "' - trying once more with a new boat")
-            task.wait(4)
+        local n = 1
+        while not ok and n < 3 and running and not qs.cancel and (tostring(why):find("could not sit", 1, true) or tostring(why):find("did not appear", 1, true)) do
+            n = n + 1
+            qlog("boat: '" .. tostring(why) .. "' - spawning boat #" .. n .. " (the game gives a new one another slot)")
+            qs.status = "boat failed - spawning boat #" .. n
+            task.wait(3)
             ok, why = sail(table.unpack(args, 1, args.n))
         end
+        if not ok then qlog("boat: failed after " .. n .. " boat(s): " .. tostring(why) .. " -> falling back to walking / teleport") end
         return ok, why
     end
     -- travel (teleport or boat, with teleport as the fallback) -----------------------------------
@@ -5477,7 +5491,17 @@ setPage("Quest")
     local function step()
         local char = lp.Character
         if not char then return end
-        if char:GetAttribute("Minigame") == true then qs.status = "waiting (fish on the line)"; return end
+        if char:GetAttribute("Minigame") == true then
+            -- a fish on the line only postpones the quest steps when nothing is due: a finished quest / ended cooldown must
+            -- not wait for a gap between two fish (auto fishing keeps the minigame on almost all the time)
+            local due = false
+            if Config.AutoTicketQuest and tick() >= (qs.holdUntil or 0) and tick() - (qs.lastTalk or 0) >= 25 then
+                local tt = readTicket()
+                due = (tt.active and tt.done) or (not tt.active and tt.cooldown <= 0)
+            end
+            if not due then qs.status = "waiting (fish on the line)"; return end
+            qlog("quest due while a fish is on the line -> going to the NPC anyway")
+        end
         if swimming() then
             ui.questBusy = true
             rescueWater(Config.QuestFarm and farmPos() or nil)
@@ -5832,7 +5856,7 @@ setPage("Quest")
     end
     task.spawn(function()
         while running do
-            task.wait(perf.ultra and 5 or 1.5)
+            task.wait(perf.ultra and 2.5 or 1.5)
             pcall(function()
                 local t = readTicket()
                 local o = t.objs[1]
