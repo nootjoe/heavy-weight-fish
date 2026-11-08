@@ -2098,6 +2098,68 @@ do
         return nil
     end
 
+    -- cast diagnostics: why did the server refuse the cast? (kept in getgenv().PPY_CastLog, last 60 lines, also printed)
+    function hm.dlog(msg)
+        local env = (getgenv and getgenv()) or _G
+        env.PPY_CastLog = env.PPY_CastLog or {}
+        local line = string.format("[%.0f] %s", tick() % 100000, msg)
+        table.insert(env.PPY_CastLog, line)
+        if #env.PPY_CastLog > 60 then table.remove(env.PPY_CastLog, 1) end
+        print("[PPY cast] " .. line)
+    end
+    function hm.diagnose(cf)
+        pcall(function()
+            local char = lp.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if not root then return end
+            local at = {}
+            for _, k in ipairs({ "Fishing", "Retractable", "CDForTheNextThrow", "Holding", "Swimming", "Minigame", "CastingUntil", "Type" }) do
+                at[#at + 1] = k .. "=" .. tostring(char:GetAttribute(k))
+            end
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = { char }
+            local look = cf.LookVector
+            local rays = {}
+            for _, h in ipairs({ 0.6, 1.5, 3.5 }) do
+                local w = workspace:Raycast(cf.Position + Vector3.new(0, h, 0), look * 14, params)
+                rays[#rays + 1] = "h" .. h .. ":" .. (w and (w.Instance.Name .. "/" .. tostring(w.Material) .. "@" .. math.floor((w.Position - cf.Position).Magnitude)) or "free")
+            end
+            local down = workspace:Raycast(cf.Position + look * 12 + Vector3.new(0, 40, 0), Vector3.new(0, -140, 0), params)
+            local ng = 0
+            for _, q in ipairs(workspace:GetPartBoundsInRadius(cf.Position + look * 6, 6)) do
+                if not q:IsDescendantOf(char) then ng = ng + 1 end
+            end
+            hm.dlog(string.format("cast failed #%d at (%d,%d,%d) look (%.2f,%.2f) | %s | %s | 12 ahead: %s | %d parts within 6 studs ahead",
+                hm.fails, cf.Position.X, cf.Position.Y, cf.Position.Z, look.X, look.Z, table.concat(at, " "), table.concat(rays, " "),
+                down and (down.Instance.Name .. "/" .. tostring(down.Material)) or "nothing below", ng))
+        end)
+    end
+    -- the rod may not really be in the hand (hotbar toggled twice by hand, a skill / minigame un-equipped it): put it back
+    function hm.reequip()
+        if hm.equipping then return end
+        hm.equipping = true
+        task.spawn(function()
+            pcall(function()
+                local char = lp.Character
+                local ev = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
+                local toggle = ev and ev:FindFirstChild("ToggleHotbar")
+                local pd = getData()
+                local slot = pd and findRodSlot(pd) or 1
+                if not (toggle and slot) then return end
+                local holding = char and char:GetAttribute("Holding")
+                hm.dlog("re-equipping the rod (Holding=" .. tostring(holding) .. ", slot " .. tostring(slot) .. ")")
+                if holding ~= nil and holding ~= "None" then
+                    pcall(function() toggle:InvokeServer(slot) end)      -- unequip ...
+                    task.wait(0.7)
+                end
+                pcall(function() toggle:InvokeServer(slot) end)          -- ... and equip again
+                task.wait(0.7)
+            end)
+            hm.equipping = false
+        end)
+    end
+
     -- go back to the spot (walk, or snap when very far) and face the sea
     function hm.align(why)
         if hm.busy or not hm.spot then return end
@@ -2110,6 +2172,8 @@ do
                 hm.fails = 1
                 hm.turns = (hm.turns or 0) + 1
                 why = "Cast blocked - trying another direction (#" .. hm.turns .. ")"
+                hm.dlog("turning to direction (" .. string.format("%.2f,%.2f", nl.X, nl.Z) .. ") #" .. hm.turns)
+                if hm.turns % 6 == 0 then hm.reequip() end
             end
         end
         local spot = hm.spot
@@ -2221,6 +2285,7 @@ do
             hm.pendingCast = nil
             hm.fails = hm.fails + 1
             hm.needFace = true
+            hm.diagnose(p.cf)
             if not hm.spot then hm.spot = hm.makeSpot(p.cf) end   -- no saved spot yet: recover from where we stand
         end
     end
