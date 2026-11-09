@@ -2840,6 +2840,18 @@ do
     end)
 end
 
+do   -- one-click server hop in the title bar (works with the Misc > Server hop settings: same server list, same re-execute)
+    local HopBtn = ui.titleBtn("⇄", -138, Color3.fromRGB(120, 170, 255))
+    HopBtn.MouseButton1Click:Connect(function()
+        play(clickSound)
+        if ui.hopOnce then
+            ui.hopOnce()
+        else
+            pcall(function() StarterGui:SetCore("SendNotification", { Title = "Server hop", Text = "not ready yet", Duration = 3 }) end)
+        end
+    end)
+end
+
 -- layout: sidebar with the tabs on the left, a rounded panel (pages + status line) on the right ---------------
 local Content = new("Frame", {
     Size = UDim2.new(1, -140, 1, -70), Position = UDim2.new(0, 130, 0, 60), BackgroundColor3 = Color3.fromRGB(26, 26, 27), BorderSizePixel = 0,   -- right-hand content panel
@@ -3982,11 +3994,18 @@ function ui.buildHop()   -- (a function of its own: the main chunk is at its lim
         hop.stopOnFound = v
         save()
     end)
-    actionButton("Hop to another server now", 32, function()
-        play(clickSound)
+    function ui.hopOnce()   -- also used by the ⇄ button in the title bar
         if busy then return end
         busy = true
-        task.spawn(function() task.wait(hopNow()); busy = false end)
+        task.spawn(function()
+            pcall(function() StarterGui:SetCore("SendNotification", { Title = "Server hop", Text = "searching for a server...", Duration = 3 }) end)
+            task.wait(hopNow())
+            busy = false
+        end)
+    end
+    actionButton("Hop to another server now", 32, function()
+        play(clickSound)
+        ui.hopOnce()
     end)
     ui.sub("Wanted weather")
     for _, w in ipairs(WEATHERS) do
