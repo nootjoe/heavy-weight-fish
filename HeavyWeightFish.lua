@@ -78,6 +78,7 @@ local Config = {
     BuyBaitAmount = 400,      -- stock to buy up to (hard maximum 400)
     BuyBaitBelow = 0,         -- buy when the equipped bait count is at or below this
     BaitTravel = "Walk",      -- "Walk" (walks, teleports when too far / stuck) or "Teleport"
+    UiFx = true,              -- fishing themed window effects (waves, bubbles, ripples, swimming fish logo)
     RememberBait = true,      -- remember the bait YOU equipped and equip it again after the next execute
     SavedBait = "",
     QuestBait = "Auto",       -- bait to equip for "use bait" quests: "Off", "Auto" (cheapest you own) or a bait name
@@ -531,7 +532,7 @@ local function saveSettings()
             LiveMsgId = live.id, LiveMsgUrl = Config.WebhookUrl, RhythmMethod = Config.RhythmMethod, TalkMethod = Config.TalkMethod,
             AutoBuyBait = Config.AutoBuyBait, BuyBaitName = Config.BuyBaitName, BuyBaitAmount = Config.BuyBaitAmount,
             BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel, QuestBait = Config.QuestBait,
-            RememberBait = Config.RememberBait, SavedBait = Config.SavedBait,
+            RememberBait = Config.RememberBait, SavedBait = Config.SavedBait, UiFx = Config.UiFx,
             QuestFarmPos = Config.QuestFarmPos, QuestFarmLook = Config.QuestFarmLook, QuestFarmPosEasy = Config.QuestFarmPosEasy,
             QuestFarmLookEasy = Config.QuestFarmLookEasy, QuestSplitFarm = Config.QuestSplitFarm, EasyMinAmount = Config.EasyMinAmount,
             SkillLoadout = Config.SkillLoadout, SkillEasy = Config.SkillEasy, SkillHard = Config.SkillHard,
@@ -564,6 +565,7 @@ local function loadSettings()
                 if data.BaitTravel == "Walk" or data.BaitTravel == "Teleport" then Config.BaitTravel = data.BaitTravel end
                 if type(data.QuestBait) == "string" and data.QuestBait ~= "" then Config.QuestBait = data.QuestBait end
                 if type(data.RememberBait) == "boolean" then Config.RememberBait = data.RememberBait end
+                if type(data.UiFx) == "boolean" then Config.UiFx = data.UiFx end
                 if type(data.SavedBait) == "string" then Config.SavedBait = data.SavedBait end
                 local function isPos(v) return type(v) == "table" and #v == 3 and type(v[1]) == "number" and type(v[2]) == "number" and type(v[3]) == "number" end
                 local function isLook(v) return type(v) == "table" and type(v[1]) == "number" and type(v[2]) == "number" end
@@ -2561,6 +2563,7 @@ local function engineStep()
 
     -- idle: no line out, no minigame
     if idleSince == nil then idleSince = now end
+    if ui.noCast then statusText = "Quest: pulling the line back"; return end
 
     if not Config.AutoCast then
         statusText = "Auto Cast OFF"
@@ -4019,6 +4022,160 @@ function ui.buildHop()   -- (a function of its own: the main chunk is at its lim
 end
 ui.buildHop()
 
+-- ================= fishing themed window effects (all optional: Misc > Effects; paused while minimized / ULTRA / black) ========
+function ui.buildFx()
+    local GuiService = game:GetService("GuiService")
+    local rnd = Random.new()
+    local OCEAN, FOAM, DEEP = Color3.fromRGB(16, 62, 98), Color3.fromRGB(120, 215, 255), Color3.fromRGB(8, 34, 58)
+
+    local function active()
+        return running and Config.UiFx and not minimized and not (perf and (perf.ultra or perf.black))
+    end
+
+    -- layer behind the pages: only the title bar and the (transparent) sidebar show it
+    local fx = new("Frame", { Name = "FX", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ZIndex = 0, Active = false }, Main)
+    local function visible() fx.Visible = active() end
+
+    -- 1) ocean header with a light shimmer that slides across (engine tween, no script cost)
+    local head = new("Frame", { Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 0 }, fx)
+    local grad = new("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, DEEP), ColorSequenceKeypoint.new(0.35, OCEAN),
+            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(30, 110, 150)), ColorSequenceKeypoint.new(0.65, OCEAN), ColorSequenceKeypoint.new(1, DEEP),
+        }),
+        Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 0.9) }),
+        Rotation = 0, Offset = Vector2.new(-1, 0),
+    }, head)
+    TweenService:Create(grad, TweenInfo.new(7, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1), { Offset = Vector2.new(1, 0) }):Play()
+
+    -- 2) two rows of wave dots along the bottom of the header
+    local waves = {}
+    for row = 1, 2 do
+        for i = 0, 27 do
+            local d = new("Frame", {
+                Size = UDim2.new(0, 7, 0, row == 1 and 3 or 2), AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.new(i / 27, 0, 0, 56), BackgroundColor3 = FOAM, BackgroundTransparency = row == 1 and 0.55 or 0.78,
+                BorderSizePixel = 0, ZIndex = 0,
+            }, fx)
+            corner(d, 2)
+            waves[#waves + 1] = { f = d, i = i, row = row, x = i / 27 }
+        end
+    end
+
+    -- 3) swimming fish logo on top of the old ring logo
+    local base = new("Frame", { Size = UDim2.new(0, 34, 0, 34), Position = UDim2.new(0, 16, 0, 13), BackgroundColor3 = OCEAN, BorderSizePixel = 0, ZIndex = 3 }, TitleBar)
+    corner(base, 17)
+    new("UIStroke", { Color = FOAM, Thickness = 1.5, Transparency = 0.35 }, base)
+    local swim = new("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ZIndex = 4 }, base)
+    new("Frame", { Size = UDim2.new(0, 18, 0, 11), Position = UDim2.new(0, 10, 0, 12), BackgroundColor3 = FOAM, BorderSizePixel = 0, ZIndex = 4 }, swim)
+    corner(swim:GetChildren()[1], 6)
+    local tail = new("Frame", { Size = UDim2.new(0, 8, 0, 8), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 9, 0, 17.5), Rotation = 45, BackgroundColor3 = FOAM, BorderSizePixel = 0, ZIndex = 4 }, swim)
+    local eye = new("Frame", { Size = UDim2.new(0, 3, 0, 3), Position = UDim2.new(0, 23, 0, 15), BackgroundColor3 = DEEP, BorderSizePixel = 0, ZIndex = 5 }, swim)
+    corner(eye, 2)
+    TweenService:Create(swim, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Position = UDim2.new(0, 0, 0, -2) }):Play()
+    TweenService:Create(tail, TweenInfo.new(0.35, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Rotation = 80 }):Play()
+
+    -- 4) rising bubbles in the sidebar
+    local function bubble(x, y0, y1, size, dur, strokeT)
+        local b = new("Frame", { Size = UDim2.new(0, size, 0, size), Position = UDim2.new(0, x, 0, y0), BackgroundTransparency = 1, ZIndex = 0 }, fx)
+        corner(b, size)
+        local st = new("UIStroke", { Color = FOAM, Thickness = 1.2, Transparency = strokeT }, b)
+        TweenService:Create(b, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Position = UDim2.new(0, x + rnd:NextInteger(-8, 8), 0, y1) }):Play()
+        TweenService:Create(st, TweenInfo.new(dur, Enum.EasingStyle.Linear), { Transparency = 1 }):Play()
+        task.delay(dur + 0.1, function() b:Destroy() end)
+    end
+    for k = 1, 7 do
+        task.spawn(function()
+            task.wait(rnd:NextNumber(0, 6))
+            while running do
+                if active() and Main.AbsoluteSize.Y > 200 then
+                    local h = Main.AbsoluteSize.Y
+                    bubble(rnd:NextInteger(8, 112), h - 24, rnd:NextInteger(70, 160), rnd:NextInteger(4, 10), rnd:NextNumber(5, 9), 0.45)
+                end
+                task.wait(rnd:NextNumber(2.5, 6))
+            end
+        end)
+    end
+
+    -- 5) ripple under every click / tap inside the window
+    local rippleParent = new("Frame", { Name = "Ripples", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ZIndex = 60, Active = false, ClipsDescendants = true }, Main)
+    conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
+        if not active() then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local off = (sg.IgnoreGuiInset and GuiService:GetGuiInset()) or Vector2.new(0, 0)
+        local p = Vector2.new(input.Position.X, input.Position.Y) + off - Main.AbsolutePosition
+        local sz = Main.AbsoluteSize
+        if p.X < 0 or p.Y < 0 or p.X > sz.X or p.Y > sz.Y then return end
+        local r = new("Frame", { Size = UDim2.new(0, 6, 0, 6), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, p.X, 0, p.Y), BackgroundTransparency = 1, ZIndex = 61 }, rippleParent)
+        corner(r, 100)
+        local st = new("UIStroke", { Color = FOAM, Thickness = 2, Transparency = 0.25 }, r)
+        TweenService:Create(r, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = UDim2.new(0, 64, 0, 64) }):Play()
+        TweenService:Create(st, TweenInfo.new(0.5), { Transparency = 1 }):Play()
+        task.delay(0.55, function() r:Destroy() end)
+    end)
+
+    -- 6) fishing events: cast = small ring on the fish, bite = bright pulse, fish landed = bubble burst
+    local function ring(color, grow)
+        local r = new("Frame", { Size = UDim2.new(0, 34, 0, 34), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 33, 0, 30), BackgroundTransparency = 1, ZIndex = 2 }, fx)
+        corner(r, 100)
+        local st = new("UIStroke", { Color = color, Thickness = 2.5, Transparency = 0.1 }, r)
+        TweenService:Create(r, TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = UDim2.new(0, grow, 0, grow) }):Play()
+        TweenService:Create(st, TweenInfo.new(0.7), { Transparency = 1 }):Play()
+        task.delay(0.75, function() r:Destroy() end)
+    end
+    task.spawn(function()
+        local lastMini, lastFish = false, false
+        while running do
+            task.wait(0.2)
+            if active() then
+                local c = lp.Character
+                local mini = c and c:GetAttribute("Minigame") == true or false
+                local fishing = c and c:GetAttribute("Fishing") == true or false
+                if fishing and not lastFish then ring(FOAM, 56) end
+                if mini and not lastMini then
+                    ring(Color3.fromRGB(255, 214, 90), 90)
+                    TweenService:Create(base, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(255, 196, 60) }):Play()
+                    task.delay(0.25, function() TweenService:Create(base, TweenInfo.new(0.5), { BackgroundColor3 = OCEAN }):Play() end)
+                end
+                if lastMini and not mini then
+                    for k = 1, 7 do
+                        task.delay(k * 0.05, function()
+                            bubble(rnd:NextInteger(16, 50), 40, rnd:NextInteger(-6, 6), rnd:NextInteger(4, 8), rnd:NextNumber(0.7, 1.1), 0.2)
+                        end)
+                    end
+                end
+                lastMini, lastFish = mini, fishing
+            end
+        end
+    end)
+
+    -- wave animation (about 12 updates / s; stops while the effects are off)
+    task.spawn(function()
+        while running do
+            task.wait(1 / 12)
+            visible()
+            if fx.Visible then
+                local t = os.clock()
+                for _, w in ipairs(waves) do
+                    local y = 56 + math.sin(t * 2.2 + w.i * 0.55 + w.row * 1.7) * (w.row == 1 and 3 or 2)
+                    w.f.Position = UDim2.new(w.x, 0, 0, y)
+                end
+            end
+            base.Visible = Config.UiFx
+        end
+    end)
+    ui.fxVisible = visible
+end
+ui.buildFx()
+
+section("Effects")
+toggleButton("Fishing UI effects (waves, bubbles, ripples)", 34, Config.UiFx, function(v)
+    play(clickSound)
+    Config.UiFx = v
+    markDirty()
+    if ui.fxVisible then ui.fxVisible() end
+end)
+
 -- 🛡️ Anti AFK ----------------------------------------------------------
 section("Anti-AFK")
 toggleButton("Anti-AFK", 28, Config.AntiAFK, function(v)
@@ -4157,6 +4314,33 @@ setPage("Quest")
         end
         return cond()
     end
+    -- The server sets WalkSpeed to 0 while a fishing line is out (Fishing=true), so walking, and talking to NPCs, only work after
+    -- the line is pulled back: firing Events.Fishing while Retractable (and the throw cooldown is over) reels it in.
+    local function releaseLine(maxWait)
+        local char = lp.Character
+        if not (char and char:GetAttribute("Fishing") == true) then return true end
+        ui.noCast = true                                   -- the fishing engine must not throw a new line meanwhile
+        local t0, last = tick(), 0
+        local ev = RS:FindFirstChild("Events")
+        local fishing = ev and ev:FindFirstChild("Fishing")
+        while running and tick() - t0 < (maxWait or 25) do
+            char = lp.Character
+            if not char or char:GetAttribute("Fishing") ~= true then break end
+            if fishing and char:GetAttribute("Retractable") == true and char:GetAttribute("Minigame") ~= true
+                and char:GetAttribute("CDForTheNextThrow") ~= true and tick() - last > 1.2 then
+                last = tick()
+                local r = char:FindFirstChild("HumanoidRootPart")
+                pcall(function() fishing:FireServer(r and r.CFrame or nil) end)
+            end
+            task.wait(0.15)
+        end
+        ui.noCast = false
+        local ok = not (lp.Character and lp.Character:GetAttribute("Fishing") == true)
+        qlog(ok and string.format("fishing line pulled back after %.1fs", tick() - t0)
+            or string.format("could not pull the fishing line back in %.0fs (WalkSpeed stays 0 while it is out)", tick() - t0))
+        return ok
+    end
+
     local function tp(pos, look)
         local r = myRoot()
         qlog(string.format("TELEPORT to (%d,%d,%d)", pos.X, pos.Y, pos.Z))
@@ -4630,6 +4814,7 @@ setPage("Quest")
     local function walkTo(pos, timeout)
         local h = myHum()
         if not h then return false end
+        if lp.Character and lp.Character:GetAttribute("Fishing") == true then pcall(releaseLine) end
         pcall(jumpBoost, true)
         -- far away: follow a path from the start (goes around things) instead of bumping into them
         if dist(pos) > 30 then
@@ -4851,6 +5036,7 @@ setPage("Quest")
         end
         if not prompt then return false, "NPC has no ProximityPrompt" end
         pcall(function() prompt.RequiresLineOfSight = false end)
+        if lp.Character and lp.Character:GetAttribute("Fishing") == true then pcall(releaseLine) end
         local function promptPos()
             local par, p = prompt.Parent, nil
             pcall(function()
@@ -4888,7 +5074,14 @@ setPage("Quest")
                 end
                 break
             end
-            qlog("talk attempt " .. attempt .. " failed with '" .. TALK_METHODS[m][1] .. "' (dist " .. string.format("%.1f", pp and dist(pp) or -1) .. ", range " .. tostring(mad) .. ")")
+            local why = ""
+            pcall(function()
+                local c, hh = lp.Character, myHum()
+                why = string.format(" | Fishing=%s Ret=%s Mini=%s Holding=%s walk=%s state=%s prompt enabled=%s",
+                    tostring(c:GetAttribute("Fishing")), tostring(c:GetAttribute("Retractable")), tostring(c:GetAttribute("Minigame")),
+                    tostring(c:GetAttribute("Holding")), tostring(hh.WalkSpeed), tostring(hh:GetState()), tostring(prompt.Enabled))
+            end)
+            qlog("talk attempt " .. attempt .. " failed with '" .. TALK_METHODS[m][1] .. "' (dist " .. string.format("%.1f", pp and dist(pp) or -1) .. ", range " .. tostring(mad) .. ")" .. why)
             talkM = m % #TALK_METHODS + 1                      -- the next attempt uses the next method
         end
         if not opened then return false, "no dialogue opened (too far away?)" end
@@ -4965,14 +5158,37 @@ setPage("Quest")
             qlog("boat: using " .. boatName .. " (" .. bestSpeed .. " speed)")
         end
         Config.BoatNameUsed = boatName
+        -- boats we already have (left behind by earlier trips, often being removed by the server right now) must not be taken
+        -- for the new one: they carry the same name "Boat_<userId>", FindFirstChild returned the OLD one, we teleported onto
+        -- its seat while the server deleted it and fell into the sea
+        local oldBoats = {}
+        do
+            local bF0 = Workspace:FindFirstChild("Boat")
+            if bF0 then
+                for _, lf in ipairs(bF0:GetChildren()) do
+                    for _, b in ipairs(lf:GetChildren()) do
+                        if b.Name == "Boat_" .. lp.UserId or b:GetAttribute("OwnerUserId") == lp.UserId then oldBoats[b] = true end
+                    end
+                end
+            end
+        end
         pcall(function() spawnR:FireServer(boatName, loc) end)
         task.delay(1.2, closeShop)
         local boat = nil
         if not waitFor(function()
             local bF = Workspace:FindFirstChild("Boat")
             local lF = bF and bF:FindFirstChild(tostring(loc))
-            boat = lF and lF:FindFirstChild("Boat_" .. lp.UserId)
-            return boat ~= nil and boat:FindFirstChild("VehicleSeat") ~= nil and boat:FindFirstChild("Root") ~= nil
+            boat = nil
+            if lF then
+                for _, b in ipairs(lF:GetChildren()) do
+                    if (b.Name == "Boat_" .. lp.UserId or b:GetAttribute("OwnerUserId") == lp.UserId) and not oldBoats[b]
+                        and b:FindFirstChild("VehicleSeat") ~= nil and b:FindFirstChild("Root") ~= nil then
+                        boat = b
+                        break
+                    end
+                end
+            end
+            return boat ~= nil
         end, 12) then return false, "boat did not appear (is '" .. tostring(Config.BoatNameUsed) .. "' your boat?)" end
         local seat, h = boat.VehicleSeat, myHum()
         if not h then return false, "no humanoid" end
@@ -5768,13 +5984,14 @@ setPage("Quest")
             if not due then qs.status = "waiting (fish on the line)"; return end
             qlog("quest due while a fish is on the line -> going to the NPC anyway")
         end
-        if swimming() then
+        if Config.AutoTicketQuest and swimming() then      -- the water rescue (jumping to shore) belongs to auto quest only
             ui.questBusy = true
             rescueWater(Config.QuestFarm and farmPos() or nil)
             ui.questBusy = false
             return
         end
         if Config.AutoBuyBait and tick() >= (qs.baitHold or 0) and needBait() then
+            releaseLine()
             ui.questBusy = true
             qs.lastTalk = tick()
             local okB, errB = pcall(buyBait)
@@ -5804,6 +6021,7 @@ setPage("Quest")
         if t.active and not t.done then
             qs.status = "working on the quest"
             if Config.QuestFarm and needFarmMove() then
+                releaseLine()
                 ui.questBusy = true
                 goFarm()
                 ui.questBusy = false
@@ -5811,6 +6029,7 @@ setPage("Quest")
         elseif ((t.active and t.done) or t.cooldown <= 0) and tick() >= (qs.holdUntil or 0) then
             if tick() - qs.lastTalk < 25 then qs.status = "waiting (talked just now)"; return end
             qs.status = t.active and "turning in the quest" or ("accepting a " .. Config.TicketDifficulty .. " quest")
+            releaseLine()
             ui.questBusy = true
             qs.lastTalk = tick()
             visit()
@@ -5819,6 +6038,7 @@ setPage("Quest")
         else
             qs.status = "cooldown - fishing at the farm spot"
             if Config.QuestFarm and needFarmMove() then
+                releaseLine()
                 ui.questBusy = true
                 goFarm()
                 ui.questBusy = false
