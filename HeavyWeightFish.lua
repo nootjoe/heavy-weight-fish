@@ -78,6 +78,8 @@ local Config = {
     BuyBaitAmount = 400,      -- stock to buy up to (hard maximum 400)
     BuyBaitBelow = 0,         -- buy when the equipped bait count is at or below this
     BaitTravel = "Walk",      -- "Walk" (walks, teleports when too far / stuck) or "Teleport"
+    RememberBait = true,      -- remember the bait YOU equipped and equip it again after the next execute
+    SavedBait = "",
     QuestBait = "Auto",       -- bait to equip for "use bait" quests: "Off", "Auto" (cheapest you own) or a bait name
     QuestFarmPos = { 1362, 9, 268 },   -- Battlefield fishing spot (cast position seen in the log: 1362.21, 9.28, 267.87)
     QuestFarmLook = nil,               -- { x, z } facing of the farm spot (set by "Save my current position")
@@ -112,8 +114,9 @@ local Config = {
     BreakMax = 15,            -- ... and latest (the real delay is random and sometimes falls outside this range)
     BreakWalk = 8,            -- studs: how far from the fishing spot a break may wander
     FaceSea = true,           -- before every cast: stand on the saved spot and look in the saved (sea) direction
-    MoveOnNoFish = true,      -- N casts in a row without a single bite -> move to another spot nearby
-    NoFishCasts = 6,          -- ... N
+    MoveOnRetract = true,     -- the line comes back by itself (no bite, no minigame) -> stand somewhere else
+    TurnOnRetract = true,     -- a retracted cast first turns you to another direction ...
+    RetractCasts = 2,         -- ... and from this many retracted casts in a row on it moves you (1 = move right away)
     LeaveGameAFK = true,      -- if the game puts you in its own AFK mode (after 60s w/o keyboard/click), switch it off again
     WebhookEnabled = false,
     WebhookUrl = "",
@@ -527,7 +530,8 @@ local function saveSettings()
             WebhookLive = Config.WebhookLive, LiveInterval = Config.LiveInterval,
             LiveMsgId = live.id, LiveMsgUrl = Config.WebhookUrl, RhythmMethod = Config.RhythmMethod, TalkMethod = Config.TalkMethod,
             AutoBuyBait = Config.AutoBuyBait, BuyBaitName = Config.BuyBaitName, BuyBaitAmount = Config.BuyBaitAmount,
-            BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel,
+            BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel, QuestBait = Config.QuestBait,
+            RememberBait = Config.RememberBait, SavedBait = Config.SavedBait,
             QuestFarmPos = Config.QuestFarmPos, QuestFarmLook = Config.QuestFarmLook, QuestFarmPosEasy = Config.QuestFarmPosEasy,
             QuestFarmLookEasy = Config.QuestFarmLookEasy, QuestSplitFarm = Config.QuestSplitFarm, EasyMinAmount = Config.EasyMinAmount,
             SkillLoadout = Config.SkillLoadout, SkillEasy = Config.SkillEasy, SkillHard = Config.SkillHard,
@@ -558,6 +562,9 @@ local function loadSettings()
                 if type(data.BuyBaitAmount) == "number" then Config.BuyBaitAmount = math.clamp(math.floor(data.BuyBaitAmount), 1, 400) end
                 if type(data.BuyBaitBelow) == "number" then Config.BuyBaitBelow = math.clamp(math.floor(data.BuyBaitBelow), 0, 399) end
                 if data.BaitTravel == "Walk" or data.BaitTravel == "Teleport" then Config.BaitTravel = data.BaitTravel end
+                if type(data.QuestBait) == "string" and data.QuestBait ~= "" then Config.QuestBait = data.QuestBait end
+                if type(data.RememberBait) == "boolean" then Config.RememberBait = data.RememberBait end
+                if type(data.SavedBait) == "string" then Config.SavedBait = data.SavedBait end
                 local function isPos(v) return type(v) == "table" and #v == 3 and type(v[1]) == "number" and type(v[2]) == "number" and type(v[3]) == "number" end
                 local function isLook(v) return type(v) == "table" and type(v[1]) == "number" and type(v[2]) == "number" end
                 if isPos(data.QuestFarmPos) then Config.QuestFarmPos = data.QuestFarmPos end
@@ -2241,12 +2248,26 @@ do
         hm.spot = best
         hm.fails, hm.needFace = 0, true
         hm.tried, hm.turns = nil, 0
-        hm.dlog(string.format("no bite for %d casts -> moving to (%.0f,%.0f) look (%.2f,%.2f), move #%d", Config.NoFishCasts, best.pos.X, best.pos.Z, best.look.X, best.look.Z, hm.moves))
-        hm.align("No bite for " .. Config.NoFishCasts .. " casts - moving to another spot")
+        hm.dlog(string.format("moving to a new spot (%.0f,%.0f) look (%.2f,%.2f), move #%d", best.pos.X, best.pos.Z, best.look.X, best.look.Z, hm.moves))
+        hm.align("Line not on the sea - moving to another spot")
         return true
     end
 
     -- go back to the spot (walk, or snap when very far) and face the sea
+    -- the line was retracted: look in another direction (same standing spot)
+    function hm.turnNow()
+        local spot = hm.spot
+        if not spot or hm.busy then return false end
+        local nl = hm.nextLook(spot.pos, spot.look)
+        if not nl then return false end
+        spot.look = nl
+        hm.fails, hm.needFace = 0, true
+        hm.turns = (hm.turns or 0) + 1
+        hm.dlog(string.format("line retracted -> turning to (%.2f,%.2f) #%d", nl.X, nl.Z, hm.turns))
+        hm.align("Line retracted - turning to another direction")
+        return true
+    end
+
     function hm.align(why)
         if hm.busy or not hm.spot then return end
         -- two casts in a row did not start: something blocks the way (or it is not water) -> turn to another direction.
@@ -2398,7 +2419,7 @@ local function engineStep()
         return
     end
     hookRemotes(Events)
-    if ui.questBusy then statusText = "Quest: travelling / talking to NPC"; detailText = ""; return end
+    if ui.questBusy then hm.lastBusy = now; wasFishing = false; statusText = "Quest: travelling / talking to NPC"; detailText = ""; return end
 
     local pData = getData()
     local pg = lp:FindFirstChild("PlayerGui")
@@ -2453,9 +2474,23 @@ local function engineStep()
     ----------------------------------------------------------------
     -- Track the cast timers
     ----------------------------------------------------------------
+    if hm.busy then hm.lastBusy = now end
+    if isMinigame then hm.sawBite = true; hm.retractN = 0 end
     if isFishing and not wasFishing then
         fishingStartTime = now
+        hm.sawBite = isMinigame
     elseif not isFishing then
+        -- the line ended by itself before any bite / minigame (and not because we were walking): the cast was retracted
+        if wasFishing and fishingStartTime > 0 and not hm.sawBite and not isMinigame
+            and now - fishingStartTime < (RECAST_TIMEOUT - 1) and now - (hm.lastBusy or -100) > 4 then
+            hm.retractN = (hm.retractN or 0) + 1
+            hm.dlog(string.format("cast retracted after %.1fs without a bite (#%d in a row)", now - fishingStartTime, hm.retractN))
+            if Config.MoveOnRetract and hm.retractN >= (Config.RetractCasts or 2) then
+                hm.wantMove = true
+            elseif Config.TurnOnRetract then
+                hm.wantTurn = true
+            end
+        end
         fishingStartTime = 0
     end
     wasFishing = isFishing
@@ -2552,6 +2587,17 @@ local function engineStep()
         statusText = hm.text
         return
     end
+    if hm.wantTurn and not hm.wantMove then
+        hm.wantTurn = false
+        if hm.spot and hm.turnNow() then statusText = hm.text; return end
+    end
+    if hm.wantMove then
+        hm.wantTurn = false
+        hm.wantMove = false
+        hm.retractN = 0
+        if not hm.spot then hm.spot = hm.makeSpot(root.CFrame) end
+        if hm.relocate() then statusText = hm.text; return end
+    end
     if Config.IdleMotion and now >= hm.nextAt then
         hm.startBreak()
         statusText = hm.text
@@ -2582,10 +2628,6 @@ local function engineStep()
         return
     end
 
-    if Config.MoveOnNoFish and hm.spot and hm.noFish >= (Config.NoFishCasts or 6) and not hm.busy then
-        if hm.relocate() then statusText = hm.text; return end
-    end
-
     if (Config.FaceSea or hm.fails > 0) and hm.needAlign(root) then
         hm.align((hm.fails > 0) and "Cast failed - facing the spot again..." or "Facing the sea...")
         statusText = hm.text
@@ -2595,7 +2637,6 @@ local function engineStep()
     local castCF = root.CFrame
     pcall(function() fishing:FireServer(castCF) end)
     hm.pendingCast = { t = now, cf = castCF }
-    hm.noFish = (hm.noFish or 0) + 1
     lastCastTime = now
     if hm.fails >= 3 then
         statusText = "Casting (last " .. hm.fails .. " casts failed - face the sea, then press Set fishing spot)"
@@ -3267,12 +3308,16 @@ toggleButton("Face the sea before each cast", 30, Config.FaceSea, function(v)
     play(clickSound)
     Config.FaceSea = v
 end)
-toggleButton("Move when nothing bites", 30, Config.MoveOnNoFish, function(v)
+toggleButton("Turn when the line is retracted", 30, Config.TurnOnRetract, function(v)
     play(clickSound)
-    Config.MoveOnNoFish = v
+    Config.TurnOnRetract = v
 end)
-makeSlider("Casts without a bite", "", 3, 20, 1, 1, 0, Config.NoFishCasts, function(v)
-    Config.NoFishCasts = v
+toggleButton("Move when the line is retracted", 30, Config.MoveOnRetract, function(v)
+    play(clickSound)
+    Config.MoveOnRetract = v
+end)
+makeSlider("Retracted casts before moving", "", 1, 6, 1, 1, 0, Config.RetractCasts, function(v)
+    Config.RetractCasts = v
 end)
 actionButton("Set fishing spot here", 28, function()
     play(clickSound)
@@ -3729,6 +3774,42 @@ end)
 ui.endSub()
 ui.hook = infoCard({ { "next", "Next update" }, { "status", "Last result" } }, 0.28)
 uiReady = true
+
+-- remember the bait the player equips (not the ones the script swaps in for quests / after buying) and put it back on
+-- the next execute, so the bait never has to be chosen again
+task.spawn(function()
+    pcall(function()
+        local data = getData()
+        local eq = data and data:FindFirstChild("EquippedBait")
+        if not eq then return end
+        local function ownsBait(name)
+            local bf = data:FindFirstChild("Bait")
+            local v = bf and bf:FindFirstChild(name)
+            return v ~= nil and (tonumber(v.Value) or 0) > 0
+        end
+        task.wait(4)
+        if Config.RememberBait and Config.SavedBait ~= "" and eq.Value ~= Config.SavedBait and ownsBait(Config.SavedBait) then
+            local ev = RS:FindFirstChild("Events")
+            local r = ev and ev:FindFirstChild("EquipBait")
+            if r then
+                ui.baitByScript = tick()
+                pcall(function() r:InvokeServer(Config.SavedBait) end)
+            end
+        end
+        eq.Changed:Connect(function(v)
+            if not Config.RememberBait or type(v) ~= "string" or v == "" then return end
+            if tick() - (ui.baitByScript or 0) < 4 then return end
+            if v ~= Config.SavedBait then
+                Config.SavedBait = v
+                pcall(markDirty)
+            end
+        end)
+        if Config.RememberBait and Config.SavedBait == "" and type(eq.Value) == "string" and eq.Value ~= "" then
+            Config.SavedBait = eq.Value
+            pcall(markDirty)
+        end
+    end)
+end)
 
 end
 
@@ -4643,6 +4724,7 @@ setPage("Quest")
         qs.lastBait = tick()
         local ev = RS:FindFirstChild("Events")
         local r = ev and ev:FindFirstChild("EquipBait")
+        ui.baitByScript = tick()
         if r then pcall(function() r:InvokeServer(pick.name) end) end
     end
 
@@ -5495,6 +5577,7 @@ setPage("Quest")
             if eq ~= name and (baitCount(eq) <= (tonumber(Config.BuyBaitBelow) or 0) or Config.BuyBaitName ~= "Auto") then
                 local ev = RS:FindFirstChild("Events")
                 local r = ev and ev:FindFirstChild("EquipBait")
+                ui.baitByScript = tick()
                 if r then pcall(function() r:InvokeServer(name) end) end
             end
             qs.status = string.format("bought %d x %s", bought, name)
@@ -5793,6 +5876,7 @@ setPage("Quest")
             for i, o in ipairs(opts) do if o == Config.QuestBait then idx = i end end
             Config.QuestBait = opts[idx % #opts + 1]
             baitBtn.Text = baitText()
+            pcall(markDirty)
         end)
     end
     ui.endSub()
@@ -5991,6 +6075,11 @@ setPage("Quest")
     end)
     ui.endSub()
     ui.sub("Auto buy bait")
+    toggleButton("Remember my bait (equip it after execute)", 34, Config.RememberBait, function(v)
+        play(clickSound)
+        Config.RememberBait = v
+        pcall(markDirty)
+    end)
     toggleButton("Auto buy bait when it runs out", 34, Config.AutoBuyBait, function(v)
         play(clickSound)
         Config.AutoBuyBait = v
