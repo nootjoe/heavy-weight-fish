@@ -67,6 +67,8 @@ local Config = {
     HoldOnInvincible = true,  -- do not spend attack skills while the boss is invincible (~3 s after it restores its HP)
     FpsCap = 30,              -- used by "Limit FPS"
     AutoTicketQuest = false,  -- Quest tab: accept / turn in the Ticket Quest and fish at the farm spot meanwhile
+    AutoQuestAtLevel = false, -- switch Auto ticket quest ON by itself once your level reaches AutoQuestLevel (you can still switch it off)
+    AutoQuestLevel = 50,
     TicketDifficulty = "Hard",
     QuestFarm = true,
     QuestTravel = "Boat",     -- "Boat" (default) or "Teleport"
@@ -531,7 +533,7 @@ local function saveSettings()
             WebhookLive = Config.WebhookLive, LiveInterval = Config.LiveInterval,
             LiveMsgId = live.id, LiveMsgUrl = Config.WebhookUrl, RhythmMethod = Config.RhythmMethod, TalkMethod = Config.TalkMethod,
             AutoBuyBait = Config.AutoBuyBait, BuyBaitName = Config.BuyBaitName, BuyBaitAmount = Config.BuyBaitAmount,
-            BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel, QuestBait = Config.QuestBait,
+            BuyBaitBelow = Config.BuyBaitBelow, BaitTravel = Config.BaitTravel, QuestBait = Config.QuestBait, AutoQuestAtLevel = Config.AutoQuestAtLevel, AutoQuestLevel = Config.AutoQuestLevel,
             RememberBait = Config.RememberBait, SavedBait = Config.SavedBait, UiFx = Config.UiFx,
             QuestFarmPos = Config.QuestFarmPos, QuestFarmLook = Config.QuestFarmLook, QuestFarmPosEasy = Config.QuestFarmPosEasy,
             QuestFarmLookEasy = Config.QuestFarmLookEasy, QuestSplitFarm = Config.QuestSplitFarm, EasyMinAmount = Config.EasyMinAmount,
@@ -564,6 +566,8 @@ local function loadSettings()
                 if type(data.BuyBaitBelow) == "number" then Config.BuyBaitBelow = math.clamp(math.floor(data.BuyBaitBelow), 0, 399) end
                 if data.BaitTravel == "Walk" or data.BaitTravel == "Teleport" then Config.BaitTravel = data.BaitTravel end
                 if type(data.QuestBait) == "string" and data.QuestBait ~= "" then Config.QuestBait = data.QuestBait end
+                if type(data.AutoQuestAtLevel) == "boolean" then Config.AutoQuestAtLevel = data.AutoQuestAtLevel end
+                if type(data.AutoQuestLevel) == "number" then Config.AutoQuestLevel = math.clamp(math.floor(data.AutoQuestLevel), 1, 2500) end
                 if type(data.RememberBait) == "boolean" then Config.RememberBait = data.RememberBait end
                 if type(data.UiFx) == "boolean" then Config.UiFx = data.UiFx end
                 if type(data.SavedBait) == "string" then Config.SavedBait = data.SavedBait end
@@ -6455,11 +6459,25 @@ setPage("Quest")
     local info = infoCard({
         { "state", "State" }, { "quest", "Quest" }, { "obj", "Task" }, { "prog", "Progress" }, { "cd", "Cooldown" }, { "pos", "Farm spot / distance" }, { "boat", "Last boat trip" },
     }, 0.38)
-    toggleButton("Auto ticket quest", 34, Config.AutoTicketQuest, function(v)
+    local _, setQuestToggle = toggleButton("Auto ticket quest", 34, Config.AutoTicketQuest, function(v)
         play(clickSound)
         Config.AutoTicketQuest = v
+        qs.levelFired = true                         -- a manual switch always wins over the level trigger
         if not v and not Config.AutoBuyBait then task.spawn(function() pcall(resetQuestState, "quest turned off") end) end
     end)
+    ui.sub("Start at a level")
+    toggleButton("Switch Auto ticket quest on at level", 30, Config.AutoQuestAtLevel, function(v)
+        play(clickSound)
+        Config.AutoQuestAtLevel = v
+        qs.levelFired = false                        -- armed again: fires when your level is high enough
+        pcall(markDirty)
+    end)
+    makeSlider("Level to start at", "", 1, 2500, 1, 1, 0, Config.AutoQuestLevel, function(v)
+        Config.AutoQuestLevel = math.floor(v)
+        qs.levelFired = false
+        pcall(markDirty)
+    end)
+    ui.endSub()
     ui.sub("Options")
     toggleButton("Fish at the farm spot meanwhile", 30, Config.QuestFarm, function(v)
         play(clickSound)
@@ -6727,6 +6745,18 @@ setPage("Quest")
                 info.pos(string.upper(farmKindNow()) .. "  " .. (d == math.huge and "-" or (math.floor(d) .. " studs")))
                 info.boat(qs.boatResult or "-")
                 if ui.refreshSkillRows then pcall(ui.refreshSkillRows, false) end
+                -- level trigger: once the level reaches the chosen one, Auto ticket quest turns itself on (once; the switch stays yours)
+                if Config.AutoQuestAtLevel and not Config.AutoTicketQuest and not qs.levelFired then
+                    local st = readStats()
+                    local lv = st and st.level
+                    if lv and lv >= Config.AutoQuestLevel then
+                        qs.levelFired = true
+                        Config.AutoTicketQuest = true
+                        if setQuestToggle then setQuestToggle(true) end
+                        qs.status = "level " .. lv .. " reached - Auto ticket quest switched on"
+                        pcall(markDirty)
+                    end
+                end
                 if (Config.AutoTicketQuest or Config.AutoBuyBait) and not qs.busy then guarded(step) end
             end)
         end
